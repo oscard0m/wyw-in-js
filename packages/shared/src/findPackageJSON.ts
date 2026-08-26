@@ -90,7 +90,7 @@ export function findPackageJSON(
     }
 
     if (code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-      // See https://github.com/Anber/wyw-in-js/issues/43
+      // See https://github.com/wyw-in-js/wyw-in-js/issues/43
       // `require` can't resolve ESM-only packages. We can use the `resolve`
       // package here, but it does not solve all cases because `pkgName`
       // can be an alias and should be resolved by a bundler. However, we can't use
