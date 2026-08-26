@@ -6,9 +6,9 @@ export default {
   primaryHue: 210,
   primarySaturation: 100,
   docsRepositoryBase:
-    'https://github.com/Anber/wyw-in-js/tree/main/apps/website',
+    'https://github.com/wyw-in-js/wyw-in-js/tree/main/apps/website',
   project: {
-    link: 'https://github.com/Anber/wyw-in-js',
+    link: 'https://github.com/wyw-in-js/wyw-in-js',
   },
   useNextSeoProps() {
     return {
