@@ -6,6 +6,7 @@ import {
   evaluateOxcStaticExpression,
   isOxcStaticSerializableValue,
   lookupStaticBinding,
+  type OxcStaticImportReference,
   type OxcStaticValueCandidate,
 } from '../../../utils/collectOxcTemplateDependencies';
 import type { ITransformAction, SyncScenarioFor } from '../../types';
@@ -28,6 +29,48 @@ export type CandidateSideEffectProvenance = {
   dependencies: string[];
   importLocals: string[];
 };
+
+function* resolveCandidateImport(
+  action: ITransformAction,
+  filename: string,
+  item: OxcStaticImportReference,
+  memo: Map<string, StaticExportResult | null>
+): SyncScenarioFor<StaticExportResult | null> {
+  const staticBindings = getStaticBindings(action);
+  let override = lookupStaticBinding(
+    staticBindings,
+    item.source,
+    item.imported
+  );
+  if (!override.found && staticBindings) {
+    const dep = yield* resolveDependency(
+      action,
+      filename,
+      item.source,
+      item.imported
+    );
+    if (dep?.resolved) {
+      override = lookupStaticBinding(
+        staticBindings,
+        dep.resolved,
+        item.imported
+      );
+    }
+  }
+  if (override.found) {
+    return { dependencies: [], value: override.value };
+  }
+
+  return yield* resolveImportValue(action, filename, item, new Set(), memo);
+}
+
+const isImmutablePrimitive = (value: unknown): boolean =>
+  value === null ||
+  typeof value === 'string' ||
+  typeof value === 'number' ||
+  typeof value === 'boolean' ||
+  typeof value === 'bigint' ||
+  typeof value === 'symbol';
 
 /**
  * Proves which imports must remain for CSS artifacts produced by the import
@@ -106,36 +149,10 @@ export function* resolveCandidateValue(
     // absolute path and try again — this lets the host key by
     // absolute file path so a single entry covers every relative
     // variant of the same module.
-    let override = lookupStaticBinding(
-      staticBindingsForCandidate,
-      item.source,
-      item.imported
-    );
-    if (!override.found && staticBindingsForCandidate) {
-      const dep = yield* resolveDependency(
-        action,
-        filename,
-        item.source,
-        item.imported
-      );
-      if (dep?.resolved) {
-        override = lookupStaticBinding(
-          staticBindingsForCandidate,
-          dep.resolved,
-          item.imported
-        );
-      }
-    }
-    if (override.found) {
-      env.set(item.local, override.value);
-      continue;
-    }
-
-    const resolved = yield* resolveImportValue(
+    const resolved = yield* resolveCandidateImport(
       action,
       filename,
       item,
-      new Set(),
       memo
     );
     if (!resolved) {
@@ -191,6 +208,47 @@ export function* resolveCandidateValue(
       sideEffectDependencies.add(dependency);
       sideEffectImportLocals.add(item.importLocal ?? item.local);
     });
+  }
+
+  for (const guard of candidate.mutationGuards ?? []) {
+    const guardEnv = new Map<string, unknown>();
+    let resolvedGuard = true;
+    for (const item of guard.imports) {
+      const resolved = yield* resolveCandidateImport(
+        action,
+        filename,
+        item,
+        memo
+      );
+      if (!resolved) {
+        resolvedGuard = false;
+        break;
+      }
+
+      guardEnv.set(item.local, resolved.value);
+      resolved.dependencies.forEach((dependency) =>
+        dependencies.add(dependency)
+      );
+    }
+
+    const guardValue = resolvedGuard
+      ? evaluateOxcStaticExpression(
+          guard.source,
+          filename,
+          guardEnv,
+          staticBindingsForCandidate
+        )
+      : undefined;
+    if (guardValue === undefined || !isImmutablePrimitive(guardValue)) {
+      debugStaticResolve(action, {
+        candidate: candidate.name,
+        filename,
+        phase: 'candidate',
+        reason: 'candidate-mutation-guard-unresolved',
+        status: 'rejected',
+      });
+      return reject('candidate-mutation-guard-unresolved');
+    }
   }
 
   if (candidateExpression === undefined) {

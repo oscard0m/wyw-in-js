@@ -8,7 +8,10 @@ import {
   collectOxcPatternRuntimeExpressions,
   collectOxcPatternShorthandProperties,
 } from '../oxc/patterns';
-import { isOxcFunctionLike } from '../oxc/runtimeSemantics';
+import {
+  isOxcFunctionLike,
+  unwrapOxcRuntimeExpression,
+} from '../oxc/runtimeSemantics';
 import { toOxcBindingIdentity } from './bindingIdentity';
 import { findResolvedReferences as getReferences } from './bindingResolution';
 import {
@@ -166,6 +169,46 @@ export const hasBindingMutationBefore = (
       (hazard) => !isKnownPureStaticCall(hazard, ctx)
     )
   );
+};
+
+export const collectBindingMutationGuardsBefore = (
+  binding: Binding,
+  referenceStart: number,
+  ctx: ExtractionContext
+): readonly Expression[] | null => {
+  const bindingKey = toMutationBindingKey(binding);
+  if (
+    hasTimelineStartBefore(
+      getMutationTimeline(ctx.rootMutationsByBinding, bindingKey),
+      referenceStart
+    )
+  ) {
+    return null;
+  }
+
+  const guardedExpressions = new Set<Expression>();
+  const hasUnconditionalHazard = someHazardTimelineEndAtOrBefore(
+    getHazardTimelineAt(bindingKey, referenceStart, ctx),
+    referenceStart,
+    ctx,
+    (hazard) => {
+      if (isKnownPureStaticCall(hazard, ctx)) {
+        return false;
+      }
+
+      const guards = ctx.rootMutationHazardGuardsByBinding
+        .get(bindingKey)
+        ?.get(hazard);
+      if (!guards || guards.length === 0) {
+        return true;
+      }
+
+      guards.forEach((expression) => guardedExpressions.add(expression));
+      return false;
+    }
+  );
+
+  return hasUnconditionalHazard ? null : [...guardedExpressions];
 };
 
 export const hasOpaqueDestructuringHazardBefore = (
@@ -396,6 +439,40 @@ function collectStaticLocalExpression(
         : ctx.code.slice(expression.start, expression.end),
   };
 }
+
+const isStaticMutationGuardProjection = (node: Node): boolean => {
+  const expression = unwrapOxcRuntimeExpression(node, false);
+  if (expression.type === 'Identifier') {
+    return true;
+  }
+  if (expression.type !== 'MemberExpression' || expression.optional) {
+    return false;
+  }
+
+  if (!isStaticMutationGuardProjection(expression.object)) {
+    return false;
+  }
+  if (!expression.computed) {
+    return expression.property.type === 'Identifier';
+  }
+
+  return (
+    expression.property.type === 'Literal' &&
+    (typeof expression.property.value === 'string' ||
+      typeof expression.property.value === 'number')
+  );
+};
+
+export const collectStaticMutationGuardExpression = (
+  expression: Expression,
+  ctx: ExtractionContext
+): StaticLocalExpression | null => {
+  const unwrapped = unwrapOxcRuntimeExpression(expression, false);
+  return unwrapped.type === 'MemberExpression' &&
+    isStaticMutationGuardProjection(expression)
+    ? collectStaticLocalExpression(expression, ctx)
+    : null;
+};
 
 function collectStaticDestructuringProjection(
   binding: Binding,

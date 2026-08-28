@@ -63,6 +63,16 @@ export interface IPreevalResult {
       local: string;
       source: string;
     }>;
+    mutationGuards?: Array<{
+      importedFrom: string[];
+      imports: Array<{
+        imported: 'default' | string;
+        importLocal?: string;
+        local: string;
+        source: string;
+      }>;
+      source: string;
+    }>;
     name: string;
     source: string;
   }>;

@@ -198,12 +198,20 @@ const collectRootMutationHazards = (
   processorManagedExpressionNodes: ReadonlySet<Node>,
   ignoredHazardNodes: ReadonlySet<Node>,
   ignoredHazardTreeNodes: ReadonlySet<Node>
-): Map<string, Node[]> => {
+): {
+  guardsByBinding: Map<string, Map<Node, readonly Expression[] | null>>;
+  hazards: Map<string, Node[]>;
+} => {
   const { bindingsByName } = bindingIndex;
   const hazards = new Map<string, Node[]>();
   const factPublished = 1;
   const factStrong = 2;
   const factsByBinding = new Map<string, Map<Node, number>>();
+  const guardExpressionsByBinding = new Map<
+    string,
+    Map<Node, Expression[] | null>
+  >();
+  const guardRevisionsByBinding = new Map<string, Map<Node, number>>();
   const getFacts = (key: string): Map<Node, number> => {
     const existing = factsByBinding.get(key);
     if (existing) {
@@ -212,6 +220,51 @@ const collectRootMutationHazards = (
     const created = new Map<Node, number>();
     factsByBinding.set(key, created);
     return created;
+  };
+  const getGuardRevision = (key: string, hazard: Node): number =>
+    guardRevisionsByBinding.get(key)?.get(hazard) ?? 0;
+  const mergeGuardState = (
+    guards: Map<Node, Expression[] | null>,
+    hazard: Node,
+    incoming: readonly Expression[] | null
+  ): boolean => {
+    const current = guards.get(hazard);
+    if (current === null) {
+      return false;
+    }
+
+    let changed = false;
+    if (incoming === null) {
+      guards.set(hazard, null);
+      changed = true;
+    } else if (current === undefined) {
+      guards.set(hazard, [...incoming]);
+      changed = true;
+    } else {
+      incoming.forEach((expression) => {
+        if (!current.includes(expression)) {
+          current.push(expression);
+          changed = true;
+        }
+      });
+    }
+
+    return changed;
+  };
+  const mergeGuardExpressions = (
+    key: string,
+    hazard: Node,
+    incoming: readonly Expression[] | null
+  ): boolean => {
+    const guards = guardExpressionsByBinding.get(key) ?? new Map();
+    const changed = mergeGuardState(guards, hazard, incoming);
+    if (changed) {
+      guardExpressionsByBinding.set(key, guards);
+      const revisions = guardRevisionsByBinding.get(key) ?? new Map();
+      revisions.set(hazard, (revisions.get(hazard) ?? 0) + 1);
+      guardRevisionsByBinding.set(key, revisions);
+    }
+    return changed;
   };
 
   const modeledMutations = new Set<Node>(
@@ -320,20 +373,25 @@ const collectRootMutationHazards = (
 
   const collectDeferredReferencePolicy =
     createDeferredReferencePolicyCollector(bindingIndex);
-  const collectEagerReferenceKeys = (node: Node): string[] => {
+  const collectEagerReferences = (node: Node) => {
     const { ignoredStarts } = collectDeferredReferencePolicy(node);
     const projection = getProcessorProjection(node);
-    return collectMutationReferenceKeys(
-      node,
-      bindingIndex,
-      [
-        ignoredHazardTreeReferenceStarts,
-        ignoredStarts,
-        ...(projection ? [projection.referenceStarts] : []),
-      ],
-      toReferenceKey
+    const excludedStarts = [
+      ignoredHazardTreeReferenceStarts,
+      ignoredStarts,
+      ...(projection ? [projection.referenceStarts] : []),
+    ];
+    return getReferences(node, bindingIndex).filter((reference) =>
+      excludedStarts.every((starts) => !starts.has(reference.start))
     );
   };
+  const collectEagerReferenceKeys = (node: Node): string[] => [
+    ...new Set(
+      collectEagerReferences(node).map(({ binding, name }) =>
+        toReferenceKey(binding, name)
+      )
+    ),
+  ];
 
   const collectAliasReferenceKeys = (
     node: Node,
@@ -463,7 +521,8 @@ const collectRootMutationHazards = (
   const addHazard = (
     name: string,
     hazard: Node,
-    canAffectSiblingImport = false
+    canAffectSiblingImport = false,
+    mutationGuard?: Expression
   ): void => {
     const facts = getFacts(name);
     const current = facts.get(hazard) ?? 0;
@@ -476,15 +535,23 @@ const collectRootMutationHazards = (
       hazard,
       current | factPublished | (canAffectSiblingImport ? factStrong : 0)
     );
+    if (canAffectSiblingImport) {
+      mergeGuardExpressions(
+        name,
+        hazard,
+        mutationGuard ? [mutationGuard] : null
+      );
+    }
   };
 
   const addReferences = (
     node: Node,
     hazard: Node,
-    canAffectSiblingImport = false
+    canAffectSiblingImport = false,
+    mutationGuard?: Expression
   ): void => {
     collectEagerReferenceKeys(node).forEach((key) => {
-      addHazard(key, hazard, canAffectSiblingImport);
+      addHazard(key, hazard, canAffectSiblingImport, mutationGuard);
     });
   };
 
@@ -554,15 +621,42 @@ const collectRootMutationHazards = (
     }
 
     if (node.type === 'CallExpression') {
-      // Any object passed to unknown code, or used as a method receiver, can
-      // be mutated. Pure calls are intentionally rejected here rather than
-      // risking a stale static snapshot.
+      // Opaque calls use a capability-bounded effect model: callees may mutate
+      // objects reachable through their arguments or receiver, while ambient
+      // writes through globals, closures, or the callee's own imports are
+      // outside the static guarantee and remain the author's responsibility.
       // References inside nested processor-managed expressions are projected
       // out by addReferences because the outer invocation receives their
       // evaltime replacements, not their original interpolation inputs.
-      // Starting at the invocation keeps an inline IIFE body eager while the
-      // deferred-reference policy still skips callback arguments.
-      addReferences(node, node, true);
+      // Preserve invocation context while collecting hard references. In
+      // particular, an inline IIFE callee is eager only when the traversal
+      // starts at this CallExpression. Direct non-spread arguments retain
+      // their exact expression as a conditional proof; their precise
+      // reference starts are excluded from the hard pass below.
+      const guardedReferenceStarts = new Set<number>();
+      node.arguments.forEach((argument) => {
+        if (argument.type === 'SpreadElement') {
+          return;
+        }
+        collectEagerReferences(argument).forEach((reference) => {
+          guardedReferenceStarts.add(reference.start);
+          addHazard(
+            toReferenceKey(reference.binding, reference.name),
+            node,
+            true,
+            argument
+          );
+        });
+      });
+      collectEagerReferences(node).forEach((reference) => {
+        if (!guardedReferenceStarts.has(reference.start)) {
+          addHazard(
+            toReferenceKey(reference.binding, reference.name),
+            node,
+            true
+          );
+        }
+      });
       addExecutionUnknownAliasHazard(node.callee, node);
       node.arguments.forEach((argument) => {
         addExecutionUnknownAliasHazard(argument, node);
@@ -871,18 +965,25 @@ const collectRootMutationHazards = (
   // published hazard membership is tracked separately from modeled mutation
   // seeds. The indexes let each new fact or promotion visit only adjacent
   // links instead of rescanning the complete alias graph.
-  type WorkItem = { change: Node; key: string; strong: boolean };
+  type WorkItem = {
+    change: Node;
+    guardRevision: number;
+    key: string;
+    strong: boolean;
+  };
   const worklist: WorkItem[] = [];
   mutations.forEach((changes, key) => {
     const facts = getFacts(key);
     changes.forEach((change) => {
       facts.set(change, (facts.get(change) ?? 0) | factStrong);
+      mergeGuardExpressions(key, change, null);
     });
   });
   factsByBinding.forEach((facts, key) => {
     facts.forEach((state, change) => {
       worklist.push({
         change,
+        guardRevision: getGuardRevision(key, change),
         key,
         strong: (state & factStrong) !== 0,
       });
@@ -900,18 +1001,31 @@ const collectRootMutationHazards = (
     bucket.push(change);
     hazards.set(key, bucket);
   };
-  const addFact = (key: string, change: Node, sibling: boolean): void => {
+  const addFact = (
+    key: string,
+    change: Node,
+    sibling: boolean,
+    guards: readonly Expression[] | null = null
+  ): void => {
     const facts = getFacts(key);
-    const state = facts.get(change);
-    publishHazard(key, change);
-    if (state === undefined) {
-      facts.set(change, factPublished | (sibling ? factStrong : 0));
-      worklist.push({ change, key, strong: sibling });
-      return;
+    const state = facts.get(change) ?? 0;
+    if ((state & factPublished) === 0) {
+      const bucket = hazards.get(key) ?? [];
+      bucket.push(change);
+      hazards.set(key, bucket);
     }
-    if ((state & factStrong) === 0 && sibling) {
-      facts.set(change, state | factPublished | factStrong);
-      worklist.push({ change, key, strong: true });
+    const next = state | factPublished | (sibling ? factStrong : 0);
+    facts.set(change, next);
+    const guardsChanged = sibling
+      ? mergeGuardExpressions(key, change, guards)
+      : false;
+    if (state === 0 || next !== state || guardsChanged) {
+      worklist.push({
+        change,
+        guardRevision: getGuardRevision(key, change),
+        key,
+        strong: (next & factStrong) !== 0,
+      });
     }
   };
   const endpointIsStrong = (keys: readonly string[], change: Node): boolean => {
@@ -942,12 +1056,15 @@ const collectRootMutationHazards = (
 
   type ImportGroup = {
     bindings: string[];
-    broadcasted: Set<Node>;
+    guardsByChange: Map<Node, Expression[] | null>;
   };
   const importGroupsByBinding = new Map<string, ImportGroup[]>();
   const importGroups: ImportGroup[] = [];
   importedBindingsBySource.forEach((bindings) => {
-    const group = { bindings, broadcasted: new Set<Node>() };
+    const group = {
+      bindings,
+      guardsByChange: new Map<Node, Expression[] | null>(),
+    };
     importGroups.push(group);
     bindings.forEach((binding) => {
       const groups = importGroupsByBinding.get(binding) ?? [];
@@ -963,6 +1080,7 @@ const collectRootMutationHazards = (
     const current = factsByBinding.get(item.key)?.get(item.change);
     if (
       current === undefined ||
+      item.guardRevision !== getGuardRevision(item.key, item.change) ||
       (!item.strong && (current & factStrong) !== 0)
     ) {
       continue;
@@ -1010,12 +1128,20 @@ const collectRootMutationHazards = (
       const importGroupsForBinding = importGroupsByBinding.get(item.key);
       if (importGroupsForBinding) {
         for (const importGroup of importGroupsForBinding) {
-          if (importGroup.broadcasted.has(item.change)) {
+          const guards =
+            guardExpressionsByBinding.get(item.key)?.get(item.change) ?? null;
+          if (
+            !mergeGuardState(importGroup.guardsByChange, item.change, guards)
+          ) {
             continue;
           }
-          importGroup.broadcasted.add(item.change);
+          // A later alias path may still promote a conditional group state to
+          // an unconditional one. Only a real group-state change re-broadcasts
+          // the fact; sibling work items with the same state stay O(1).
+          const groupGuards =
+            importGroup.guardsByChange.get(item.change) ?? null;
           for (const binding of importGroup.bindings) {
-            addFact(binding, item.change, true);
+            addFact(binding, item.change, true, groupGuards);
           }
         }
       }
@@ -1025,8 +1151,8 @@ const collectRootMutationHazards = (
   // Imported mutation/sibling facts conservatively affect unknown aliases,
   // but this final publication is intentionally weak and does not re-enter the
   // worklist.
-  importGroups.forEach(({ broadcasted }) => {
-    broadcasted.forEach((change) =>
+  importGroups.forEach(({ guardsByChange }) => {
+    guardsByChange.forEach((_guards, change) =>
       publishHazard(unknownAliasMutationBinding, change)
     );
   });
@@ -1040,7 +1166,7 @@ const collectRootMutationHazards = (
     }
   });
 
-  return hazards;
+  return { guardsByBinding: guardExpressionsByBinding, hazards };
 };
 
 export const collectProgramMutationAnalysis = (
@@ -1052,12 +1178,20 @@ export const collectProgramMutationAnalysis = (
   hasEffectiveMutationHazardSeed: boolean
 ): Pick<
   ProgramAnalysis,
-  'rootMutationHazardsByBinding' | 'rootMutationsByBinding'
+  | 'rootMutationHazardGuardsByBinding'
+  | 'rootMutationHazardsByBinding'
+  | 'rootMutationsByBinding'
 > => {
   const rootMutationsByBinding = collectRootMutations(program);
-  const rootMutationHazardsByBinding =
+  const mutationHazards =
     rootMutationsByBinding.size === 0 && !hasEffectiveMutationHazardSeed
-      ? new Map<string, Node[]>()
+      ? {
+          guardsByBinding: new Map<
+            string,
+            Map<Node, readonly Expression[] | null>
+          >(),
+          hazards: new Map<string, Node[]>(),
+        }
       : collectRootMutationHazards(
           program,
           rootMutationsByBinding,
@@ -1068,8 +1202,9 @@ export const collectProgramMutationAnalysis = (
         );
 
   return {
+    rootMutationHazardGuardsByBinding: mutationHazards.guardsByBinding,
     rootMutationHazardsByBinding: sealMutationTimelineMap(
-      rootMutationHazardsByBinding
+      mutationHazards.hazards
     ),
     rootMutationsByBinding: sealMutationTimelineMap(rootMutationsByBinding),
   };

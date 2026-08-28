@@ -47,13 +47,14 @@ import {
 } from './snapshotReplay';
 import {
   allocateExpressionName,
+  collectBindingMutationGuardsBefore,
   collectStaticBindingExpression,
+  collectStaticMutationGuardExpression,
   containsProcessorManagedExpression,
   declarationInitCode,
   declarationPatternCode,
   expressionHasNestedCallTimeUncertainty,
   getHoistedBindingName,
-  hasBindingMutationBefore,
   hasOpaqueDestructuringHazardBefore,
   hasReferencedRootMutationBefore,
   nestedDestructuringHasCallTimeUncertainty,
@@ -69,6 +70,7 @@ import type {
   OxcStaticImportReference,
   ProgramAnalysis,
   StaticBindings,
+  StaticLocalExpression,
   TemplateExtractionResult,
 } from './types';
 
@@ -442,6 +444,7 @@ const extractExpression = (
         importedFrom: [],
         kind: isFunction ? ValueType.FUNCTION : ValueType.LAZY,
         staticImports: [],
+        staticMutationGuards: [],
         staticValue: isStaticSerializableValue(evaluated)
           ? cloneStaticValue(evaluated)
           : undefined,
@@ -459,6 +462,7 @@ const extractExpression = (
   const staticImports: OxcStaticImportReference[] = [
     ...namespaceStatic.imports,
   ];
+  const staticMutationGuards: StaticLocalExpression[] = [];
   let hasNonStaticLocalReference = preserveRuntimeIdentity;
   let hasInlinableLocalReference = false;
   let hasSnapshotReplay = preserveRuntimeIdentity;
@@ -492,9 +496,25 @@ const extractExpression = (
 
     if (binding.importedFrom) {
       importedFrom.push(binding.importedFrom);
-      if (hasBindingMutationBefore(binding, start, ctx)) {
+      const mutationGuardExpressions = collectBindingMutationGuardsBefore(
+        binding,
+        start,
+        ctx
+      );
+      if (mutationGuardExpressions === null) {
         hasNonStaticLocalReference = true;
         return;
+      }
+      for (const guardExpression of mutationGuardExpressions) {
+        const guard = collectStaticMutationGuardExpression(
+          guardExpression,
+          ctx
+        );
+        if (!guard) {
+          hasNonStaticLocalReference = true;
+          return;
+        }
+        staticMutationGuards.push(guard);
       }
 
       if (binding.imported && binding.imported !== '*') {
@@ -624,6 +644,9 @@ const extractExpression = (
     hasInlinableLocalReference:
       !hasNonStaticLocalReference && hasInlinableLocalReference,
     staticImports: hasNonStaticLocalReference ? [] : staticImports,
+    staticMutationGuards: hasNonStaticLocalReference
+      ? []
+      : staticMutationGuards,
     staticValue: preservedStaticValue,
   };
 };
@@ -673,6 +696,7 @@ const extractExpressions = (
   analysis: Pick<
     ProgramAnalysis,
     | 'bindingIndex'
+    | 'rootMutationHazardGuardsByBinding'
     | 'rootMutationHazardsByBinding'
     | 'rootMutationsByBinding'
     | 'usedNames'
@@ -711,6 +735,8 @@ const extractExpressions = (
     ),
     program,
     replacements: [],
+    rootMutationHazardGuardsByBinding:
+      analysis.rootMutationHazardGuardsByBinding,
     rootMutationHazardsByBinding: analysis.rootMutationHazardsByBinding,
     rootMutationsByBinding: analysis.rootMutationsByBinding,
     staticBindings,
@@ -752,6 +778,7 @@ const extractExpressions = (
       kind,
       staticExpressionCode,
       staticImports,
+      staticMutationGuards,
       staticValue,
     } = extractExpression(
       expression,
@@ -786,8 +813,15 @@ const extractExpressions = (
           item
         );
       });
+      const uniqueMutationGuards = new Map<string, StaticLocalExpression>();
+      staticMutationGuards.forEach((guard) => {
+        uniqueMutationGuards.set(guard.source, guard);
+      });
       ctx.staticValueCandidates.push({
         imports: [...uniqueImports.values()],
+        ...(uniqueMutationGuards.size > 0
+          ? { mutationGuards: [...uniqueMutationGuards.values()] }
+          : {}),
         name: expName,
         source: staticExpressionCode ?? expressionCode,
       });
@@ -867,6 +901,8 @@ export const evaluateOxcStaticExpressionAt = (
     ),
     program,
     replacements: [],
+    rootMutationHazardGuardsByBinding:
+      analysis.rootMutationHazardGuardsByBinding,
     rootMutationHazardsByBinding: analysis.rootMutationHazardsByBinding,
     rootMutationsByBinding: analysis.rootMutationsByBinding,
     staticBindings,
