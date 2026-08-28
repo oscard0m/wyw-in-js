@@ -15,7 +15,10 @@ import {
 } from '../oxc/assignmentTargets';
 import { getOxcNodeChildren } from '../oxc/ast';
 import { collectOxcPatternBindingNames } from '../oxc/patterns';
-import { isOxcFunctionLike } from '../oxc/runtimeSemantics';
+import {
+  isOxcFunctionLike,
+  unwrapOxcRuntimeExpression,
+} from '../oxc/runtimeSemantics';
 import {
   findResolvedReferences as getReferences,
   resolveBindingInIndex,
@@ -417,6 +420,26 @@ const collectRootMutationHazards = (
         binding.declaredAt < node.start ||
         node.end <= binding.declaredAt
     );
+  const collectCapturedResultAliasReferenceKeys = (node: Node): string[] => {
+    const expression = unwrapOxcRuntimeExpression(node, true);
+    if (expression.type !== 'CallExpression') {
+      return collectCapturedAliasReferenceKeys(node);
+    }
+
+    const sources = expression.arguments.flatMap((argument) =>
+      collectCapturedAliasReferenceKeys(argument)
+    );
+    const callee = unwrapOxcRuntimeExpression(expression.callee, true);
+    if (callee.type === 'MemberExpression') {
+      sources.push(...collectCapturedAliasReferenceKeys(callee.object));
+    }
+
+    // An opaque call result may alias argument or receiver capabilities. Other
+    // return provenance is represented by unprovenResult; including the callee
+    // itself here connects separate calls through an earlier result and can
+    // turn a guarded primitive argument hazard into an unconditional one.
+    return [...new Set(sources)];
+  };
 
   const containsUnprovenAlias = (node: Node): boolean => {
     const projection = getProcessorProjection(node);
@@ -865,7 +888,7 @@ const collectRootMutationHazards = (
       aliasLinks.push({
         declaredAt: node.end,
         executionOwner: getExecutionOwner(bindingIndex, node),
-        sources: collectCapturedAliasReferenceKeys(node.right),
+        sources: collectCapturedResultAliasReferenceKeys(node.right),
         targets: collectReferenceKeys(node.left),
         unprovenResult: containsUnprovenAlias(node.right),
       });
@@ -888,7 +911,7 @@ const collectRootMutationHazards = (
     const sources = [
       ...new Set(
         sourceExpressions.flatMap((expression) =>
-          collectCapturedAliasReferenceKeys(expression)
+          collectCapturedResultAliasReferenceKeys(expression)
         )
       ),
     ];
@@ -1028,6 +1051,27 @@ const collectRootMutationHazards = (
       });
     }
   };
+  const getAliasPropagationGuards = (
+    key: string,
+    change: Node
+  ): readonly Expression[] | null => {
+    const guards = guardExpressionsByBinding.get(key)?.get(change);
+    if (!guards || guards.length === 0) {
+      return null;
+    }
+
+    return guards.every((guard) => {
+      const references = getReferences(guard, bindingIndex);
+      return (
+        references.length > 0 &&
+        references.every(
+          ({ binding }) => binding?.isRoot && binding.importedFrom
+        )
+      );
+    })
+      ? guards
+      : null;
+  };
   const endpointIsStrong = (keys: readonly string[], change: Node): boolean => {
     for (const key of keys) {
       if (((factsByBinding.get(key)?.get(change) ?? 0) & factStrong) !== 0) {
@@ -1085,6 +1129,10 @@ const collectRootMutationHazards = (
     ) {
       continue;
     }
+    const aliasPropagationGuards = getAliasPropagationGuards(
+      item.key,
+      item.change
+    );
 
     const targetLinks = linksByTarget.get(item.key);
     if (targetLinks) {
@@ -1101,7 +1149,7 @@ const collectRootMutationHazards = (
         }
         const strong = endpointIsStrong(link.targets, item.change);
         for (const source of link.sources) {
-          addFact(source, item.change, strong);
+          addFact(source, item.change, strong, aliasPropagationGuards);
         }
       }
     }
@@ -1119,7 +1167,7 @@ const collectRootMutationHazards = (
         }
         const strong = endpointIsStrong(link.sources, item.change);
         for (const target of link.targets) {
-          addFact(target, item.change, strong);
+          addFact(target, item.change, strong, aliasPropagationGuards);
         }
       }
     }

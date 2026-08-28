@@ -4,6 +4,7 @@ import { cx } from './classnames';
 import { textClasses, themeVars } from './static-cx-order-tokens';
 
 export const text = cx(textClasses.regular, textClasses.small);
+export const smallText = cx(textClasses.small);
 
 export const separator = css`
   border-top: ${themeVars.borderSeparator};

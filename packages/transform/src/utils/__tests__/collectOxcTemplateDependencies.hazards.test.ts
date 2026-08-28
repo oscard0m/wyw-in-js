@@ -818,6 +818,29 @@ describe('collectOxcTemplateDependencies mutation provenance', () => {
     ]);
   });
 
+  it('retains direct imported guards through an earlier opaque call result', () => {
+    const result = collectOxcTemplateDependencies(
+      dedent`
+        import { alias, source } from './tokens';
+
+        const first = mutate(alias.className);
+        mutate(alias.otherClassName);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+      filename,
+      true
+    );
+
+    expect(result.staticValueCandidates).toEqual([
+      expect.objectContaining({
+        mutationGuards: [
+          expect.objectContaining({ source: 'alias.className' }),
+          expect.objectContaining({ source: 'alias.otherClassName' }),
+        ],
+      }),
+    ]);
+  });
+
   it('drops conditional guards after alias propagation', () => {
     expectLastWidthTemplateFallback(dedent`
       import { alias, source } from './tokens';
