@@ -103,4 +103,19 @@ describe('Bun bundler', () => {
 
     expect(cssOutput).toMatch(/color:\s*(rebeccapurple|#639)/i);
   });
+
+  it('statically resolves interpolations declared after cx()', async () => {
+    await rm(outDir, { recursive: true, force: true });
+
+    const cssOutput = normalizeLineEndings(
+      await buildArtefact(
+        outDir,
+        { eval: { strategy: 'static' } },
+        'static-cx-order.ts'
+      )
+    );
+
+    expect(cssOutput).toContain('border-top: var(--borderSeparator)');
+    expect(cssOutput).toContain('border-top: var(--borderSeparatorDimmed)');
+  });
 });

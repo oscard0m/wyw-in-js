@@ -86,6 +86,11 @@ const collectStaticPlanFacts = (
     candidate.imports.forEach(({ imported: name, source }) => {
       importedNeeds.push({ name, source });
     });
+    candidate.mutationGuards?.forEach((guard) => {
+      guard.imports.forEach(({ imported: name, source }) => {
+        importedNeeds.push({ name, source });
+      });
+    });
   });
 
   return {

@@ -45,6 +45,7 @@ export const getEvalStrategy = (action: ITransformAction) =>
 export type StaticRejectionReason =
   | 'candidate-import-unresolved'
   | 'candidate-callable-usage-unsupported'
+  | 'candidate-mutation-guard-unresolved'
   | 'candidate-expression-non-serializable'
   | 'candidate-expression-undefined'
   | 'runtime-callback'
@@ -53,6 +54,8 @@ export type StaticRejectionReason =
 const reasonExplanations: Record<StaticRejectionReason, string> = {
   'candidate-import-unresolved': "imported value isn't statically analyzable",
   'candidate-callable-usage-unsupported': 'depends on a runtime function call',
+  'candidate-mutation-guard-unresolved':
+    'an earlier call may mutate an imported value',
   'candidate-expression-non-serializable':
     'value is non-serializable at build time',
   'candidate-expression-undefined':

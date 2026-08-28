@@ -56,6 +56,14 @@ type StaticCandidateResolution = {
   sideEffectDependencies: Set<string>;
 };
 
+const isImmutablePrimitive = (value: unknown): boolean =>
+  value === null ||
+  typeof value === 'string' ||
+  typeof value === 'number' ||
+  typeof value === 'boolean' ||
+  typeof value === 'bigint' ||
+  typeof value === 'symbol';
+
 const isProcessorArtifactValue = (
   value: unknown,
   processors: StaticProcessorInstance[],
@@ -167,6 +175,48 @@ function* resolvePreevalStaticValueCandidates(
       resolved.sideEffectDependencies?.forEach((dependency) =>
         sideEffectDependencies.add(dependency)
       );
+    }
+
+    if (!resolvedAll) {
+      continue;
+    }
+
+    for (const guard of candidate.mutationGuards ?? []) {
+      const guardEnv = new Map<string, unknown>();
+      for (const binding of guard.imports) {
+        const resolved = yield* resolvers.resolveImportValue(
+          action,
+          filename,
+          binding,
+          stack,
+          memo
+        );
+        if (!resolved) {
+          resolvedAll = false;
+          break;
+        }
+
+        guardEnv.set(binding.local, resolved.value);
+        resolved.dependencies.forEach((dependency) =>
+          dependencies.add(dependency)
+        );
+        resolved.sideEffectDependencies?.forEach((dependency) =>
+          sideEffectDependencies.add(dependency)
+        );
+      }
+
+      const guardValue = resolvedAll
+        ? evaluateOxcStaticExpression(
+            guard.source,
+            filename,
+            guardEnv,
+            getStaticBindings(action)
+          )
+        : undefined;
+      if (guardValue === undefined || !isImmutablePrimitive(guardValue)) {
+        resolvedAll = false;
+        break;
+      }
     }
 
     if (!resolvedAll) {

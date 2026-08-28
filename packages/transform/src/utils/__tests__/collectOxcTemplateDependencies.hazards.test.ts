@@ -780,6 +780,78 @@ describe('collectOxcTemplateDependencies mutation provenance', () => {
     }
   );
 
+  it('retains a conditional primitive guard for an imported member argument', () => {
+    const result = collectOxcTemplateDependencies(
+      dedent`
+        import { alias, source } from './tokens';
+
+        mutate(alias.className);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+      filename,
+      true
+    );
+
+    expect(result.staticValueCandidates).toEqual([
+      expect.objectContaining({
+        imports: [
+          {
+            imported: 'source',
+            local: 'source',
+            source: './tokens',
+          },
+        ],
+        mutationGuards: [
+          {
+            importedFrom: ['./tokens'],
+            imports: [
+              {
+                imported: 'alias',
+                local: 'alias',
+                source: './tokens',
+              },
+            ],
+            source: 'alias.className',
+          },
+        ],
+      }),
+    ]);
+  });
+
+  it('retains direct imported guards through an earlier opaque call result', () => {
+    const result = collectOxcTemplateDependencies(
+      dedent`
+        import { alias, source } from './tokens';
+
+        const first = mutate(alias.className);
+        mutate(alias.otherClassName);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+      filename,
+      true
+    );
+
+    expect(result.staticValueCandidates).toEqual([
+      expect.objectContaining({
+        mutationGuards: [
+          expect.objectContaining({ source: 'alias.className' }),
+          expect.objectContaining({ source: 'alias.otherClassName' }),
+        ],
+      }),
+    ]);
+  });
+
+  it('drops conditional guards after alias propagation', () => {
+    expectLastWidthTemplateFallback(dedent`
+      import { alias, source } from './tokens';
+
+      const localAlias = alias;
+      mutate(localAlias.className);
+      const { width } = source;
+      const template = tag\`${'${width}'}\`;
+    `);
+  });
+
   it('propagates a sibling-import escape from a synchronous IIFE', () => {
     expectLastWidthTemplateFallback(dedent`
       import { alias, source } from './tokens';

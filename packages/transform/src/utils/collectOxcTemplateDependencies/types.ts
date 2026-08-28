@@ -104,6 +104,7 @@ export type OxcStaticValue = {
 export type OxcStaticValueCandidate = {
   imports: OxcStaticImportReference[];
   inlineConstants?: Record<string, unknown>;
+  mutationGuards?: StaticLocalExpression[];
   name: string;
   source: string;
 };
@@ -126,6 +127,7 @@ export type ExtractedExpression = {
   kind: ValueType.FUNCTION | ValueType.LAZY;
   staticExpressionCode?: string;
   staticImports: OxcStaticImportReference[];
+  staticMutationGuards: StaticLocalExpression[];
   staticValue?: unknown;
 };
 
@@ -135,8 +137,14 @@ export type StaticLocalExpression = {
   source: string;
 };
 
+export type MutationHazardGuardMap = ReadonlyMap<
+  string,
+  ReadonlyMap<Node, readonly Expression[] | null>
+>;
+
 export type ProgramAnalysis = {
   bindingIndex: BindingIndex;
+  rootMutationHazardGuardsByBinding: MutationHazardGuardMap;
   rootMutationHazardsByBinding: MutationTimelineMap;
   rootMutationsByBinding: MutationTimelineMap<
     AssignmentExpression | UpdateExpression
@@ -161,6 +169,7 @@ export type ExtractionContext = {
   processorManagedExpressionSpans: Set<string>;
   program: Program;
   replacements: Replacement[];
+  rootMutationHazardGuardsByBinding: MutationHazardGuardMap;
   rootMutationHazardsByBinding: MutationTimelineLookup;
   rootMutationsByBinding: MutationTimelineMap<
     AssignmentExpression | UpdateExpression

@@ -226,6 +226,10 @@ const programDefaultMutationHazards = new WeakMap<
   Program,
   ProgramAnalysis['rootMutationHazardsByBinding']
 >();
+const programDefaultMutationHazardGuards = new WeakMap<
+  Program,
+  ProgramAnalysis['rootMutationHazardGuardsByBinding']
+>();
 const MAX_PROGRAM_ANALYSIS_VARIANTS = 4;
 const programAnalysisVariants = new WeakMap<
   Program,
@@ -609,6 +613,10 @@ export const analyzeProgram = (
     mutationHazardIgnoreLookup || mutationHazardIgnoreTreeLookup
       ? undefined
       : programDefaultMutationHazards.get(program);
+  const cachedDefaultMutationHazardGuards =
+    mutationHazardIgnoreLookup || mutationHazardIgnoreTreeLookup
+      ? undefined
+      : programDefaultMutationHazardGuards.get(program);
   const needsRequestTraversal =
     mutationHazardIgnoreLookup !== null ||
     mutationHazardIgnoreTreeLookup !== null ||
@@ -624,6 +632,7 @@ export const analyzeProgram = (
   }
 
   let rootMutationHazardsByBinding = cachedDefaultMutationHazards;
+  let rootMutationHazardGuardsByBinding = cachedDefaultMutationHazardGuards;
   let rootMutationsByBinding = programRootMutations.get(program);
   if (!rootMutationHazardsByBinding) {
     const mutationAnalysis = collectProgramMutationAnalysis(
@@ -636,12 +645,18 @@ export const analyzeProgram = (
     );
     rootMutationHazardsByBinding =
       mutationAnalysis.rootMutationHazardsByBinding;
+    rootMutationHazardGuardsByBinding =
+      mutationAnalysis.rootMutationHazardGuardsByBinding;
     rootMutationsByBinding ??= mutationAnalysis.rootMutationsByBinding;
     if (!programRootMutations.has(program)) {
       programRootMutations.set(program, rootMutationsByBinding);
     }
     if (!mutationHazardIgnoreLookup && !mutationHazardIgnoreTreeLookup) {
       programDefaultMutationHazards.set(program, rootMutationHazardsByBinding);
+      programDefaultMutationHazardGuards.set(
+        program,
+        rootMutationHazardGuardsByBinding
+      );
     }
   }
 
@@ -652,6 +667,7 @@ export const analyzeProgram = (
   Object.freeze(request.result.templateLiterals);
   const analysis: ProgramAnalysis = {
     bindingIndex: scopeFacts.bindingIndex,
+    rootMutationHazardGuardsByBinding: rootMutationHazardGuardsByBinding!,
     rootMutationHazardsByBinding,
     rootMutationsByBinding: rootMutationsByBinding!,
     targetExpressions,

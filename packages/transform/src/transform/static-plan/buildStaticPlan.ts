@@ -297,6 +297,17 @@ export const buildStaticPlan = ({
         source: item.source,
       });
     });
+    candidate.mutationGuards?.forEach((guard) => {
+      guard.imports.forEach((item) => {
+        needs.push({
+          importer: filename,
+          kind: 'export',
+          name: item.imported,
+          reason: 'processor-static-interpolation',
+          source: item.source,
+        });
+      });
+    });
   });
 
   const staticValueNames = unique(
