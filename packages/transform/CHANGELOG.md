@@ -1,5 +1,11 @@
 # @wyw-in-js/transform
 
+## 2.4.4
+
+### Patch Changes
+
+- 155d867: Treat opaque calls as capability-bounded during mutation analysis, keeping later static interpolations eligible when direct imported member arguments resolve to immutable primitives. Calls can still invalidate object-valued arguments; ambient writes through globals, closures, or the callee's own imports remain the application author's responsibility.
+
 ## 2.4.3
 
 ### Patch Changes
