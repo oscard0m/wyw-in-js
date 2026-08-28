@@ -199,7 +199,7 @@ const collectRootMutationHazards = (
   ignoredHazardNodes: ReadonlySet<Node>,
   ignoredHazardTreeNodes: ReadonlySet<Node>
 ): {
-  guardsByBinding: Map<string, Map<Node, readonly Expression[] | null>>;
+  guardsByBinding: Map<string, Map<Node, Expression[] | null>>;
   hazards: Map<string, Node[]>;
 } => {
   const { bindingsByName } = bindingIndex;
@@ -1186,10 +1186,7 @@ export const collectProgramMutationAnalysis = (
   const mutationHazards =
     rootMutationsByBinding.size === 0 && !hasEffectiveMutationHazardSeed
       ? {
-          guardsByBinding: new Map<
-            string,
-            Map<Node, readonly Expression[] | null>
-          >(),
+          guardsByBinding: new Map<string, Map<Node, Expression[] | null>>(),
           hazards: new Map<string, Node[]>(),
         }
       : collectRootMutationHazards(
