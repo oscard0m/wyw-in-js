@@ -87,6 +87,18 @@ export function* resolveStaticOxcPreevalValues(
       });
     }
 
+    for (const hint of preevalResult.pureCallHints ?? []) {
+      if (!wanted.has(hint.expressionName)) {
+        continue;
+      }
+      const detail = details.get(hint.expressionName) ?? {
+        source: hint.expressionSource,
+        reason: 'candidate-mutation-guard-unresolved' as const,
+      };
+      detail.pureCallHints = [...(detail.pureCallHints ?? []), hint];
+      details.set(hint.expressionName, detail);
+    }
+
     return details;
   };
 

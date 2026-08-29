@@ -67,6 +67,31 @@ module.exports = {
 };
 ```
 
+### Marking one call as side-effect-free
+
+With `eval.strategy: "static"`, WyW rejects a top-level call when it cannot prove that the call leaves values used by
+later style interpolations unchanged. If you know that a particular call is side-effect-free, annotate that invocation
+with the conventional `/*#__PURE__*/` or `/*@__PURE__*/` block comment:
+
+```ts
+const spacing = { medium: 12 };
+
+const serialized = /*#__PURE__*/ serialize(spacing);
+
+export const className = css`
+  padding: ${spacing.medium}px;
+`;
+```
+
+The annotation applies only to the immediately following call or constructor invocation. It tells WyW that the call does
+not mutate its arguments or other state; it does not make the returned value statically analyzable, and calls inside the
+arguments are still analyzed separately.
+
+Only add this annotation when that guarantee is true. An incorrect annotation can make extracted CSS use a value that
+the runtime call would have changed. The comment must also reach WyW intact, so configure earlier transforms to preserve
+it if necessary. When static evaluation fails because of an eligible opaque call, the error includes its file, location,
+and the exact annotation placement to consider.
+
 ## Pitfall 2: Heavy arguments to WyW tags (`styled(SomeComponent)`)
 
 ### Why this is a bottleneck

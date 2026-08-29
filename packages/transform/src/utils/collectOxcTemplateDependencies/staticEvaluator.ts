@@ -232,6 +232,13 @@ export const isKnownPureStaticCall = (
   }
 
   if (
+    (node.type === 'CallExpression' || node.type === 'NewExpression') &&
+    ctx.pureAnnotatedInvocationSpans.has(`${node.start}:${node.end}`)
+  ) {
+    return true;
+  }
+
+  if (
     node.type !== 'CallExpression' ||
     node.arguments.some((argument) => argument.type === 'SpreadElement')
   ) {

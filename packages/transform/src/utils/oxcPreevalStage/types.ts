@@ -7,7 +7,10 @@ import type {
   OxcProcessorAnalysisPlan,
   StaticPlanFacts,
 } from '../applyOxcProcessors/types';
-import type { OxcStaticValueCandidate } from '../collectOxcTemplateDependencies';
+import type {
+  OxcPureCallHint,
+  OxcStaticValueCandidate,
+} from '../collectOxcTemplateDependencies';
 
 export type OxcPreevalOptions = Pick<
   StrictOptions,
@@ -32,6 +35,7 @@ export type OxcPreevalResult = {
   metadata: WYWTransformMetadata | null;
   processorManagedExpressionSpans: ExpressionSpan[];
   processorClassNames: Record<string, string>;
+  pureCallHints: OxcPureCallHint[];
   runtimeProcessorPlan?: OxcProcessorAnalysisPlan;
   staticDependencies: string[];
   staticPlanFacts: StaticPlanFacts;

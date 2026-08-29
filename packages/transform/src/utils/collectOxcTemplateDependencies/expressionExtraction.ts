@@ -62,11 +62,13 @@ import {
 } from './staticLocalPlanning';
 import { inferSnapshotExpressionKind } from './snapshotValueAnalysis';
 import * as recursiveProof from './recursiveProof';
+import { collectPureAnnotatedInvocationSpans } from './pureAnnotations';
 import type {
   Binding,
   ExtractedExpression,
   ExpressionSpan,
   ExtractionContext,
+  OxcPureCallHint,
   OxcStaticImportReference,
   ProgramAnalysis,
   StaticBindings,
@@ -463,6 +465,10 @@ const extractExpression = (
     ...namespaceStatic.imports,
   ];
   const staticMutationGuards: StaticLocalExpression[] = [];
+  const pureCallHints = new Map<
+    string,
+    Omit<OxcPureCallHint, 'expressionName' | 'expressionSource'>
+  >();
   let hasNonStaticLocalReference = preserveRuntimeIdentity;
   let hasInlinableLocalReference = false;
   let hasSnapshotReplay = preserveRuntimeIdentity;
@@ -499,7 +505,19 @@ const extractExpression = (
       const mutationGuardExpressions = collectBindingMutationGuardsBefore(
         binding,
         start,
-        ctx
+        ctx,
+        (hazard) => {
+          const location = ctx.loc(hazard.start);
+          const hint = {
+            callColumn: location.column,
+            callEnd: hazard.end,
+            callFilename: ctx.filename,
+            callLine: location.line,
+            callSource: ctx.code.slice(hazard.start, hazard.end),
+            callStart: hazard.start,
+          };
+          pureCallHints.set(`${hazard.start}:${hazard.end}`, hint);
+        }
       );
       if (mutationGuardExpressions === null) {
         hasNonStaticLocalReference = true;
@@ -640,6 +658,7 @@ const extractExpression = (
         : source,
     importedFrom,
     kind: isFunction ? ValueType.FUNCTION : ValueType.LAZY,
+    pureCallHints: [...pureCallHints.values()],
     staticExpressionCode,
     hasInlinableLocalReference:
       !hasNonStaticLocalReference && hasInlinableLocalReference,
@@ -711,6 +730,7 @@ const extractExpressions = (
       code,
       dependencyNames: [],
       expressionValues: [],
+      pureCallHints: [],
       replacements: [],
       staticValueCandidates: [],
       staticValues: [],
@@ -734,6 +754,11 @@ const extractExpressions = (
       processorManagedExpressionSpans.map(expressionSpanKey)
     ),
     program,
+    pureAnnotatedInvocationSpans: collectPureAnnotatedInvocationSpans(
+      code,
+      filename,
+      program
+    ),
     replacements: [],
     rootMutationHazardGuardsByBinding:
       analysis.rootMutationHazardGuardsByBinding,
@@ -748,6 +773,7 @@ const extractExpressions = (
   };
 
   const snapshotWriteFallbackBindings = new Set<Binding>();
+  const pureCallHints: OxcPureCallHint[] = [];
   if (allowSnapshotWriteFallback) {
     expressions.forEach((expression, index) => {
       ctx.currentInsertionPoint = insertionPoints[index] ?? 0;
@@ -776,6 +802,7 @@ const extractExpressions = (
       hasInlinableLocalReference,
       importedFrom,
       kind,
+      pureCallHints: expressionPureCallHints = [],
       staticExpressionCode,
       staticImports,
       staticMutationGuards,
@@ -787,6 +814,13 @@ const extractExpressions = (
       snapshotWriteFallbackBindings
     );
     const expName = allocateExpressionName(ctx);
+    pureCallHints.push(
+      ...expressionPureCallHints.map((hint) => ({
+        ...hint,
+        expressionName: expName,
+        expressionSource: ctx.code.slice(expression.start, expression.end),
+      }))
+    );
 
     addHoistedCode(
       expName,
@@ -855,6 +889,7 @@ const extractExpressions = (
     code: applyOxcReplacements(code, ctx.replacements),
     dependencyNames: [...ctx.dependencyNames],
     expressionValues: ctx.expressionValues,
+    pureCallHints,
     replacements: ctx.replacements,
     staticValueCandidates: ctx.staticValueCandidates,
     staticValues: ctx.staticValues,
@@ -900,6 +935,11 @@ export const evaluateOxcStaticExpressionAt = (
       processorManagedExpressionSpans.map(expressionSpanKey)
     ),
     program,
+    pureAnnotatedInvocationSpans: collectPureAnnotatedInvocationSpans(
+      code,
+      filename,
+      program
+    ),
     replacements: [],
     rootMutationHazardGuardsByBinding:
       analysis.rootMutationHazardGuardsByBinding,

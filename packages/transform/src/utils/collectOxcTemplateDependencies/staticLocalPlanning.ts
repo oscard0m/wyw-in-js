@@ -174,7 +174,8 @@ export const hasBindingMutationBefore = (
 export const collectBindingMutationGuardsBefore = (
   binding: Binding,
   referenceStart: number,
-  ctx: ExtractionContext
+  ctx: ExtractionContext,
+  onOpaqueInvocation?: (hazard: Node) => void
 ): readonly Expression[] | null => {
   const bindingKey = toMutationBindingKey(binding);
   if (
@@ -194,6 +195,10 @@ export const collectBindingMutationGuardsBefore = (
     (hazard) => {
       if (isKnownPureStaticCall(hazard, ctx)) {
         return false;
+      }
+
+      if (hazard.type === 'CallExpression' || hazard.type === 'NewExpression') {
+        onOpaqueInvocation?.(hazard);
       }
 
       const guards = ctx.rootMutationHazardGuardsByBinding

@@ -225,6 +225,35 @@ async function runExternalCssSideEffectCase() {
   }
 }
 
+async function runStaticPureCallCase() {
+  const outDir = path.resolve(PKG_DIR, 'dist-static-pure-call');
+
+  try {
+    await fs.rm(outDir, { recursive: true, force: true });
+    await build({
+      build: {
+        cssMinify: false,
+        outDir,
+        rollupOptions: {
+          input: path.resolve(PKG_DIR, 'src/static-pure-call/index.ts'),
+        },
+      },
+      configFile: false,
+      logLevel: 'silent',
+      plugins: [wyw({ eval: { strategy: 'static' } })],
+      root: PKG_DIR,
+    });
+
+    await findFileMatching(
+      outDir,
+      (filePath, contents) =>
+        filePath.endsWith('.css') && /padding:\s*12px/.test(contents)
+    );
+  } finally {
+    await fs.rm(outDir, { recursive: true, force: true });
+  }
+}
+
 async function assertFileMatches(filePath, pattern) {
   const contents = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
 
@@ -385,6 +414,9 @@ const main = async () => {
 
   console.log(colors.blue('Running case:'), 'externalCssSideEffect');
   await runExternalCssSideEffectCase();
+
+  console.log(colors.blue('Running case:'), 'staticPureCall');
+  await runStaticPureCallCase();
 
   const preserveModulesCases = [
     {

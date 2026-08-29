@@ -1,9 +1,10 @@
 import { parseSync } from 'oxc-parser';
-import type { Program } from 'oxc-parser';
+import type { Comment, Program } from 'oxc-parser';
 
 type OxcSourceType = 'module' | 'unambiguous';
 
 type ParsedOxc = {
+  comments: Comment[];
   module: {
     hasModuleSyntax: boolean;
   };
@@ -78,6 +79,7 @@ export const parseOxcCached = (
   }
 
   return setCachedParse(cacheKey, {
+    comments: parsed.comments,
     module: {
       hasModuleSyntax: parsed.module.hasModuleSyntax,
     },

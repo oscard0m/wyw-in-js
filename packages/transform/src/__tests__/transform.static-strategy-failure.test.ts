@@ -193,6 +193,43 @@ describe('eval.strategy "static" failure diagnostics', () => {
     }
   });
 
+  it('points to an opaque call that can be annotated as PURE', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'tokens.js'),
+      'export const space = { medium: 12 };'
+    );
+    writeFileSync(
+      join(root, 'runtime.js'),
+      'export const factory = () => (value) => String(value);'
+    );
+    writeFileSync(
+      entryFile,
+      [
+        `import { css } from 'test-css-processor';`,
+        `import { factory } from './runtime.js';`,
+        `import { space } from './tokens.js';`,
+        `factory()(space);`,
+        'export const className = css`padding: ${space.medium}px;`;',
+        'export const otherClassName = css`margin: ${space.medium}px;`;',
+      ].join('\n')
+    );
+
+    try {
+      await runStatic(root, entryFile);
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).toContain(`${entryFile}:4:1`);
+      expect(message).toContain('/*#__PURE__*/ factory()(space)');
+      expect(message).toContain('side-effect-free');
+      expect(message.split('/*#__PURE__*/ factory()(space)')).toHaveLength(2);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('distinguishes a missing export (undefined) from a genuinely non-serializable value', async () => {
     const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
     const genFile = join(root, 'theme.js');

@@ -32,10 +32,16 @@ const createResolver = () => async (what: string, importer: string) => {
   return null;
 };
 
-const runStatic = async (source: string) => {
+const runStatic = async (
+  source: string,
+  modules: Record<string, string> = {}
+) => {
   const root = mkdtempSync(join(tmpdir(), 'wyw-opaque-call-'));
   const entryFile = join(root, 'entry.tsx');
   writeFileSync(entryFile, source);
+  Object.entries(modules).forEach(([name, code]) => {
+    writeFileSync(join(root, name), code);
+  });
 
   try {
     return await transform(
@@ -202,5 +208,121 @@ describe('static eval with an opaque module-level call consuming the binding', (
   it('resolves when the tag has no interpolation', async () => {
     const result = await runStatic(source(OBJECT, CALL_WHOLE, TAG_LITERAL));
     expectResolved(result.cssText);
+  });
+
+  it.each(['#__PURE__', '@__PURE__'])(
+    'trusts a %s annotation on an imported opaque call',
+    async (annotation) => {
+      const result = await runStatic(
+        dedent`
+        ${HEADER}
+        import { opaque } from './runtime';
+        import { space } from './tokens';
+
+        /*${annotation}*/ opaque(space);
+        ${TAG}
+      `,
+        {
+          'runtime.ts':
+            'export const opaque = (value: unknown) => String(value);',
+          'tokens.ts': OBJECT.replace('const ', 'export const '),
+        }
+      );
+
+      expectResolved(result.cssText);
+    }
+  );
+
+  it('trusts a PURE annotation on an imported opaque constructor', async () => {
+    const result = await runStatic(
+      dedent`
+        ${HEADER}
+        import { Opaque } from './runtime';
+        import { space } from './tokens';
+
+        /*#__PURE__*/ new Opaque(space);
+        ${TAG}
+      `,
+      {
+        'runtime.ts': dedent`
+          export class Opaque {
+            constructor(value: unknown) {
+              String(value);
+            }
+          }
+        `,
+        'tokens.ts': OBJECT.replace('const ', 'export const '),
+      }
+    );
+
+    expectResolved(result.cssText);
+  });
+
+  it('trusts a PURE annotation on the outer invocation in a call chain', async () => {
+    const result = await runStatic(
+      dedent`
+        ${HEADER}
+        import { factory } from './runtime';
+        import { space } from './tokens';
+
+        /*#__PURE__*/ factory()(space);
+        ${TAG}
+      `,
+      {
+        'runtime.ts': dedent`
+          export const factory = () => (value: unknown) => String(value);
+        `,
+        'tokens.ts': OBJECT.replace('const ', 'export const '),
+      }
+    );
+
+    expectResolved(result.cssText);
+  });
+
+  it('keeps the result of an annotated opaque call non-static', async () => {
+    try {
+      await runStatic(
+        dedent`
+          ${HEADER}
+          import { opaque } from './runtime';
+          import { space } from './tokens';
+
+          const runtimeValue = /*#__PURE__*/ opaque(space);
+          export const a = css\`padding: ${'${runtimeValue}'}px;\`;
+        `,
+        {
+          'runtime.ts':
+            'export const opaque = (value: unknown) => String(value);',
+          'tokens.ts': OBJECT.replace('const ', 'export const '),
+        }
+      );
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).toContain('eval.strategy: "static"');
+      expect(message).not.toContain('Calls that may be safe to annotate');
+    }
+  });
+
+  it('does not hide a nested opaque call in an annotated argument', async () => {
+    await expect(
+      runStatic(
+        dedent`
+          ${HEADER}
+          import { mutate, opaque } from './runtime';
+          import { space } from './tokens';
+
+          /*#__PURE__*/ opaque(mutate(space));
+          ${TAG}
+        `,
+        {
+          'runtime.ts': dedent`
+            export const mutate = (value: unknown) => value;
+            export const opaque = (value: unknown) => String(value);
+          `,
+          'tokens.ts': OBJECT.replace('const ', 'export const '),
+        }
+      )
+    ).rejects.toThrow('an earlier call may mutate an imported value');
   });
 });

@@ -42,6 +42,7 @@ export const runOxcPreevalStage = (
       metadata: null,
       processorManagedExpressionSpans: [],
       processorClassNames: {},
+      pureCallHints: [],
       runtimeProcessorPlan: processed.runtimeProcessorPlan,
       staticDependencies: [],
       staticPlanFacts: processed.staticPlanFacts,
@@ -68,6 +69,7 @@ export const runOxcPreevalStage = (
     processorClassNames: Object.fromEntries(
       processed.processorClassNamesByLocal
     ),
+    pureCallHints: processed.pureCallHints,
     runtimeProcessorPlan: processed.runtimeProcessorPlan,
     staticDependencies: [],
     staticPlanFacts: processed.staticPlanFacts,
