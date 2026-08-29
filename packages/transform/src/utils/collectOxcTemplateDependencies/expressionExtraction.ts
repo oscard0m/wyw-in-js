@@ -49,7 +49,7 @@ import {
   allocateExpressionName,
   collectBindingMutationGuardsBefore,
   collectStaticBindingExpression,
-  collectStaticMutationGuardExpression,
+  collectStaticMutationGuardExpressions,
   containsProcessorManagedExpression,
   declarationInitCode,
   declarationPatternCode,
@@ -506,15 +506,15 @@ const extractExpression = (
         return;
       }
       for (const guardExpression of mutationGuardExpressions) {
-        const guard = collectStaticMutationGuardExpression(
+        const guards = collectStaticMutationGuardExpressions(
           guardExpression,
           ctx
         );
-        if (!guard) {
+        if (!guards) {
           hasNonStaticLocalReference = true;
           return;
         }
-        staticMutationGuards.push(guard);
+        staticMutationGuards.push(...guards);
       }
 
       if (binding.imported && binding.imported !== '*') {

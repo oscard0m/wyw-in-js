@@ -463,15 +463,74 @@ const isStaticMutationGuardProjection = (node: Node): boolean => {
   );
 };
 
-export const collectStaticMutationGuardExpression = (
+export const collectStaticMutationGuardExpressions = (
   expression: Expression,
   ctx: ExtractionContext
-): StaticLocalExpression | null => {
+): StaticLocalExpression[] | null => {
   const unwrapped = unwrapOxcRuntimeExpression(expression, false);
-  return unwrapped.type === 'MemberExpression' &&
-    isStaticMutationGuardProjection(expression)
-    ? collectStaticLocalExpression(expression, ctx)
-    : null;
+  if (isStaticMutationGuardProjection(unwrapped)) {
+    const guard = collectStaticLocalExpression(unwrapped as Expression, ctx);
+    return guard ? [guard] : null;
+  }
+
+  if (unwrapped.type === 'Literal') {
+    return [];
+  }
+
+  // A newly constructed container does not expose its source bindings. The
+  // callee can only retain or mutate the projected leaf values copied into it,
+  // so validate those leaves as immutable primitives instead of rejecting the
+  // entire container guard.
+  if (unwrapped.type === 'ObjectExpression') {
+    const guards: StaticLocalExpression[] = [];
+    for (const property of unwrapped.properties) {
+      if (property.type === 'SpreadElement') {
+        return null;
+      }
+
+      if (property.computed) {
+        const keyGuards = collectStaticMutationGuardExpressions(
+          property.key as Expression,
+          ctx
+        );
+        if (!keyGuards) {
+          return null;
+        }
+        guards.push(...keyGuards);
+      }
+
+      const valueGuards = collectStaticMutationGuardExpressions(
+        property.value,
+        ctx
+      );
+      if (!valueGuards) {
+        return null;
+      }
+      guards.push(...valueGuards);
+    }
+    return guards;
+  }
+
+  if (unwrapped.type === 'ArrayExpression') {
+    const guards: StaticLocalExpression[] = [];
+    for (const element of unwrapped.elements) {
+      if (!element) {
+        continue;
+      }
+      if (element.type === 'SpreadElement') {
+        return null;
+      }
+
+      const elementGuards = collectStaticMutationGuardExpressions(element, ctx);
+      if (!elementGuards) {
+        return null;
+      }
+      guards.push(...elementGuards);
+    }
+    return guards;
+  }
+
+  return null;
 };
 
 function collectStaticDestructuringProjection(

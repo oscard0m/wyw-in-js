@@ -118,4 +118,18 @@ describe('Bun bundler', () => {
     expect(cssOutput).toContain('border-top: var(--borderSeparator)');
     expect(cssOutput).toContain('border-top: var(--borderSeparatorDimmed)');
   });
+
+  it('statically resolves interpolations after read-only object calls', async () => {
+    await rm(outDir, { recursive: true, force: true });
+
+    const cssOutput = normalizeLineEndings(
+      await buildArtefact(
+        outDir,
+        { eval: { strategy: 'static' } },
+        'static-call-order.ts'
+      )
+    );
+
+    expect(cssOutput).toContain('padding: 12px');
+  });
 });

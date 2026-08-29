@@ -818,6 +818,27 @@ describe('collectOxcTemplateDependencies mutation provenance', () => {
     ]);
   });
 
+  it('projects primitive guards out of a constructed call argument', () => {
+    const result = collectOxcTemplateDependencies(
+      dedent`
+        import { alias, source } from './tokens';
+
+        render({ className: alias.className });
+        const template = tag\`${'${source.width}'}\`;
+      `,
+      filename,
+      true
+    );
+
+    expect(result.staticValueCandidates).toEqual([
+      expect.objectContaining({
+        mutationGuards: [
+          expect.objectContaining({ source: 'alias.className' }),
+        ],
+      }),
+    ]);
+  });
+
   it('retains direct imported guards through an earlier opaque call result', () => {
     const result = collectOxcTemplateDependencies(
       dedent`
@@ -1137,6 +1158,40 @@ describe('collectOxcTemplateDependencies mutation provenance', () => {
 
   it.each([
     [
+      'String conversion',
+      dedent`
+        const source = { width: 608 };
+        String(source);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+    ],
+    [
+      'Object.keys',
+      dedent`
+        const source = { width: 608 };
+        Object.keys(source);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+    ],
+    [
+      'a read-only local helper',
+      dedent`
+        const source = { width: 608 };
+        const wrap = (value) => String(value);
+        wrap(source);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+    ],
+  ])('keeps a root-object candidate after %s', (_description, code) => {
+    const result = collectOxcTemplateDependencies(code, filename, true);
+
+    expect(result.staticValues).toEqual([{ name: '_exp', value: 608 }]);
+    expect(result.staticValueCandidates).toEqual([]);
+    expect(result.code).toContain('const _exp = () => (608);');
+  });
+
+  it.each([
+    [
       'a local alias write',
       dedent`
         const source = { width: 608 };
@@ -1170,6 +1225,30 @@ describe('collectOxcTemplateDependencies mutation provenance', () => {
       dedent`
         const source = { width: 608 };
         Object.assign(source, { width: 704 });
+        const template = tag\`${'${source.width}'}\`;
+      `,
+    ],
+    [
+      'a shadowed intrinsic',
+      dedent`
+        const source = { width: 608 };
+        const String = (value) => {
+          value.width = 704;
+          return 'mutated';
+        };
+        String(source);
+        const template = tag\`${'${source.width}'}\`;
+      `,
+    ],
+    [
+      'a mutating array callback',
+      dedent`
+        const source = { width: 608 };
+        const values = [source];
+        values.map((value) => {
+          value.width = 704;
+          return value;
+        });
         const template = tag\`${'${source.width}'}\`;
       `,
     ],
