@@ -2,7 +2,7 @@ import type { Comment, Node, Program } from 'oxc-parser';
 
 import { walkOxc } from '../oxc/ast';
 import { isOxcTransparentRuntimeExpression } from '../oxc/runtimeSemantics';
-import { parseOxcCached } from '../parseOxc';
+import { getOxcProgramComments, parseOxcCached } from '../parseOxc';
 import { collectEagerNodeStarts } from './expressionReplacements';
 
 const PURE_ANNOTATION = /^(?:#|@)__PURE__$/;
@@ -186,11 +186,9 @@ export const collectPureAnnotatedInvocationSpans = (
     return empty;
   }
 
-  const { comments: parsedComments } = parseOxcCached(
-    filename,
-    code,
-    'unambiguous'
-  );
+  const parsedComments =
+    getOxcProgramComments(program) ??
+    parseOxcCached(filename, code, 'unambiguous').comments;
   const pureComments = parsedComments
     .filter(isPureComment)
     .sort((left, right) => left.end - right.end || left.start - right.start);
