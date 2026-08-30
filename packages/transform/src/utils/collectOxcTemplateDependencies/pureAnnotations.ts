@@ -178,6 +178,14 @@ export const collectPureAnnotatedInvocationSpans = (
   const cached = pureInvocationSpansCache.get(program);
   if (cached) return cached;
 
+  // Most files do not contain a PURE annotation. Avoid rebuilding the large
+  // parse-cache key (which includes the entire source text) on that hot path.
+  if (!code.includes('__PURE__')) {
+    const empty = new Set<string>();
+    pureInvocationSpansCache.set(program, empty);
+    return empty;
+  }
+
   const { comments: parsedComments } = parseOxcCached(
     filename,
     code,

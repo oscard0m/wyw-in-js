@@ -618,13 +618,6 @@ const extractExpression = (
       return;
     }
 
-    const guardedHazards = new Set<Node>();
-    const localMutationGuardExpressions = collectMutationGuards(
-      binding,
-      start,
-      guardedHazards
-    );
-
     if (preserveRuntimeIdentity && binding.isRoot) {
       hasNonStaticLocalReference = true;
       return;
@@ -638,6 +631,13 @@ const extractExpression = (
       identifierReplacements.set(start, replacement);
       return;
     }
+
+    const guardedHazards = new Set<Node>();
+    const localMutationGuardExpressions = collectMutationGuards(
+      binding,
+      start,
+      guardedHazards
+    );
 
     const init = binding.declarator?.init;
     // Processor-managed bindings (`const x = css```, or object literals
