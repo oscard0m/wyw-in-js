@@ -119,7 +119,7 @@ describe('Bun bundler', () => {
     expect(cssOutput).toContain('border-top: var(--borderSeparatorDimmed)');
   });
 
-  it('statically resolves interpolations after read-only object calls', async () => {
+  it('statically resolves interpolations after calls with fresh primitive-only values', async () => {
     await rm(outDir, { recursive: true, force: true });
 
     const cssOutput = normalizeLineEndings(

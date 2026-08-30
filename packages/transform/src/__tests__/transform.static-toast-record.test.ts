@@ -134,17 +134,16 @@ const source = (record: string) =>
 /**
  * The real-world shape this was reduced from: a design system's toast module.
  *
- * A `Record<ToastType, Partial<ToastProps>>` builds its icons inline at module
- * scope. Each `jsx(...)` is an eagerly-evaluated opaque call consuming
- * `themeVars`, which poisons every interpolation in the file -- including the
- * `space.*` ones that never touch the record. All four tags below fail
- * together, matching the six `_exp` refs the app's Vite build reported.
+ * A record builds its icons inline at module scope. Before this fix, each
+ * eagerly evaluated `jsx(...)` call made `themeVars` appear mutable and
+ * poisoned every interpolation in the file, including the unrelated `space.*`
+ * reads. All four tags used to fail together.
  *
  * The JSX is written here as the `jsx(...)` calls it transpiles to: the source
  * form is irrelevant, and the harness does not transpile JSX itself.
  *
  * See transform.static-opaque-call-poisons-binding.test.ts for the reduced
- * ingredients; this file guards the shape an app actually hits.
+ * ingredients; this file guards the complete application-shaped case.
  */
 describe('static eval with a module-level record of eagerly built icons', () => {
   it('resolves every tag with icons built inline in the record', async () => {

@@ -73,6 +73,10 @@ export interface IPreevalResult {
         local: string;
         source: string;
       }>;
+      pureCallHintSpan?: {
+        end: number;
+        start: number;
+      };
       source: string;
     }>;
     name: string;

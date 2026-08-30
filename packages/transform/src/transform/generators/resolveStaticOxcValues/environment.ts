@@ -9,6 +9,7 @@ import { stripQueryAndHash } from '../../../utils/parseRequest';
 import type { ITransformAction } from '../../types';
 import type { StaticResolveDebugEvent } from './types';
 import type { OxcPureCallHint } from '../../../utils/collectOxcTemplateDependencies';
+import type { ExpressionSpan } from '../../../utils/collectOxcTemplateDependencies/types';
 
 export const isInsideRoot = (filename: string, root: string): boolean => {
   const relativePath = relative(root, filename);
@@ -52,11 +53,16 @@ export type StaticRejectionReason =
   | 'runtime-callback'
   | 'not-eval-dependency';
 
+export type StaticRejectionDetail = {
+  pureCallHintSpan?: ExpressionSpan;
+  reason: StaticRejectionReason;
+};
+
 const reasonExplanations: Record<StaticRejectionReason, string> = {
   'candidate-import-unresolved': "imported value isn't statically analyzable",
   'candidate-callable-usage-unsupported': 'depends on a runtime function call',
   'candidate-mutation-guard-unresolved':
-    'an earlier call may mutate an imported value',
+    'an earlier call may mutate a value used by this interpolation',
   'candidate-expression-non-serializable':
     'value is non-serializable at build time',
   'candidate-expression-undefined':

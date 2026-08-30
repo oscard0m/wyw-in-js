@@ -83,14 +83,18 @@ export const className = css`
 `;
 ```
 
-The annotation applies only to the immediately following call or constructor invocation. It tells WyW that the call does
-not mutate its arguments or other state; it does not make the returned value statically analyzable, and calls inside the
-arguments are still analyzed separately.
+The annotation applies only to the following call or constructor invocation, optionally wrapped in parentheses or
+TypeScript-only expression wrappers. In a chained invocation it also covers calls used to compute the callee, matching
+the convention used by bundlers and minifiers; calls in the annotated invocation's own arguments are still analyzed
+separately. It does not apply to a call buried inside a surrounding binary, conditional, or sequence expression. The
+annotation tells WyW that the call does not mutate its arguments or other state; it does not make the returned value
+statically analyzable.
 
 Only add this annotation when that guarantee is true. An incorrect annotation can make extracted CSS use a value that
-the runtime call would have changed. The comment must also reach WyW intact, so configure earlier transforms to preserve
-it if necessary. When static evaluation fails because of an eligible opaque call, the error includes its file, location,
-and the exact annotation placement to consider.
+the runtime call would have changed. Bundlers and minifiers also recognize this convention and may remove an unused
+annotated call, so the call must have no required side effects at runtime either. The comment must reach WyW intact, so
+configure earlier transforms to preserve it if necessary. When static evaluation fails because of an eligible opaque
+call, the error includes its file, location, and the exact annotation placement to consider.
 
 ## Pitfall 2: Heavy arguments to WyW tags (`styled(SomeComponent)`)
 

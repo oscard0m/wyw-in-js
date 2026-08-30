@@ -110,6 +110,8 @@ export type OxcStaticValueCandidate = {
 };
 
 export type OxcPureCallHint = {
+  /** The hint is useful even when no candidate guard reached the resolver. */
+  actionableWithoutRejection?: boolean;
   callEnd: number;
   callColumn: number;
   callFilename: string;
@@ -149,6 +151,7 @@ export type ExtractedExpression = {
 export type StaticLocalExpression = {
   importedFrom: string[];
   imports: OxcStaticImportReference[];
+  pureCallHintSpan?: ExpressionSpan;
   source: string;
 };
 

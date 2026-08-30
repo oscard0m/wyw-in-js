@@ -2,7 +2,7 @@
 
 import type { ExpressionValue } from '@wyw-in-js/shared';
 import { ValueType } from '@wyw-in-js/shared';
-import type { Expression, Program } from 'oxc-parser';
+import type { Expression, Node, Program } from 'oxc-parser';
 
 import { collectOxcPatternRuntimeExpressions } from '../oxc/patterns';
 import { applyOxcReplacements } from '../oxc/replacements';
@@ -469,6 +469,90 @@ const extractExpression = (
     string,
     Omit<OxcPureCallHint, 'expressionName' | 'expressionSource'>
   >();
+  const localPureCallHints = new Map<
+    string,
+    {
+      guarded: boolean;
+      hint: Omit<OxcPureCallHint, 'expressionName' | 'expressionSource'>;
+    }
+  >();
+  const pureCallHintSpansByMutationGuard = new WeakMap<
+    Expression,
+    ExpressionSpan
+  >();
+  const collectMutationGuards = (
+    binding: Binding,
+    referenceStart: number,
+    guardedHazards?: Set<Node>
+  ): readonly Expression[] | null =>
+    collectBindingMutationGuardsBefore(
+      binding,
+      referenceStart,
+      ctx,
+      (hazard, guards) => {
+        const key = `${hazard.start}:${hazard.end}`;
+        const location = ctx.loc(hazard.start);
+        const hint =
+          pureCallHints.get(key) ??
+          ({
+            callColumn: location.column,
+            callEnd: hazard.end,
+            callFilename: ctx.filename,
+            callLine: location.line,
+            callSource: ctx.code.slice(hazard.start, hazard.end),
+            callStart: hazard.start,
+          } satisfies Omit<
+            OxcPureCallHint,
+            'expressionName' | 'expressionSource'
+          >);
+        const guarded = !!guards && guards.length > 0;
+        if (guarded) {
+          guardedHazards?.add(hazard);
+        }
+        if (!guarded && binding.importedFrom) {
+          hint.actionableWithoutRejection = true;
+        }
+        pureCallHints.set(key, hint);
+        if (!binding.importedFrom) {
+          const existing = localPureCallHints.get(key);
+          localPureCallHints.set(key, {
+            guarded: existing ? existing.guarded && guarded : guarded,
+            hint,
+          });
+        }
+        guards?.forEach((guard) => {
+          pureCallHintSpansByMutationGuard.set(guard, {
+            end: hazard.end,
+            start: hazard.start,
+          });
+        });
+      }
+    );
+  const resolveMutationGuards = (
+    mutationGuardExpressions: readonly Expression[],
+    guardedHazards: ReadonlySet<Node> = new Set()
+  ): StaticLocalExpression[] | null => {
+    const resolved: StaticLocalExpression[] = [];
+    for (const guardExpression of mutationGuardExpressions) {
+      const guards = collectStaticMutationGuardExpressions(
+        guardExpression,
+        ctx,
+        guardedHazards
+      );
+      if (!guards) {
+        return null;
+      }
+      const pureCallHintSpan =
+        pureCallHintSpansByMutationGuard.get(guardExpression);
+      resolved.push(
+        ...guards.map((guard) =>
+          pureCallHintSpan ? { ...guard, pureCallHintSpan } : guard
+        )
+      );
+    }
+
+    return resolved;
+  };
   let hasNonStaticLocalReference = preserveRuntimeIdentity;
   let hasInlinableLocalReference = false;
   let hasSnapshotReplay = preserveRuntimeIdentity;
@@ -502,38 +586,19 @@ const extractExpression = (
 
     if (binding.importedFrom) {
       importedFrom.push(binding.importedFrom);
-      const mutationGuardExpressions = collectBindingMutationGuardsBefore(
-        binding,
-        start,
-        ctx,
-        (hazard) => {
-          const location = ctx.loc(hazard.start);
-          const hint = {
-            callColumn: location.column,
-            callEnd: hazard.end,
-            callFilename: ctx.filename,
-            callLine: location.line,
-            callSource: ctx.code.slice(hazard.start, hazard.end),
-            callStart: hazard.start,
-          };
-          pureCallHints.set(`${hazard.start}:${hazard.end}`, hint);
-        }
-      );
+      const mutationGuardExpressions = collectMutationGuards(binding, start);
       if (mutationGuardExpressions === null) {
         hasNonStaticLocalReference = true;
         return;
       }
-      for (const guardExpression of mutationGuardExpressions) {
-        const guards = collectStaticMutationGuardExpressions(
-          guardExpression,
-          ctx
-        );
-        if (!guards) {
-          hasNonStaticLocalReference = true;
-          return;
-        }
-        staticMutationGuards.push(...guards);
+      const resolvedMutationGuards = resolveMutationGuards(
+        mutationGuardExpressions
+      );
+      if (!resolvedMutationGuards) {
+        hasNonStaticLocalReference = true;
+        return;
       }
+      staticMutationGuards.push(...resolvedMutationGuards);
 
       if (binding.imported && binding.imported !== '*') {
         staticImports.push({
@@ -552,6 +617,13 @@ const extractExpression = (
       }
       return;
     }
+
+    const guardedHazards = new Set<Node>();
+    const localMutationGuardExpressions = collectMutationGuards(
+      binding,
+      start,
+      guardedHazards
+    );
 
     if (preserveRuntimeIdentity && binding.isRoot) {
       hasNonStaticLocalReference = true;
@@ -578,13 +650,26 @@ const extractExpression = (
       (containsTaggedTemplateExpression(init) ||
         containsProcessorManagedExpression(init, ctx));
     const staticLocalExpression =
-      evaluate && init && !isProcessorManagedLocal
-        ? collectStaticBindingExpression(binding, start, ctx)
+      evaluate &&
+      init &&
+      !isProcessorManagedLocal &&
+      localMutationGuardExpressions !== null
+        ? collectStaticBindingExpression(
+            binding,
+            start,
+            ctx,
+            [],
+            guardedHazards
+          )
         : null;
-    if (staticLocalExpression) {
+    const localStaticMutationGuards = localMutationGuardExpressions
+      ? resolveMutationGuards(localMutationGuardExpressions, guardedHazards)
+      : null;
+    if (staticLocalExpression && localStaticMutationGuards) {
       staticIdentifierReplacements.set(start, staticLocalExpression.source);
       importedFrom.push(...staticLocalExpression.importedFrom);
       staticImports.push(...staticLocalExpression.imports);
+      staticMutationGuards.push(...localStaticMutationGuards);
     } else if (isProcessorManagedLocal) {
       hasInlinableLocalReference = true;
     } else {
@@ -644,6 +729,39 @@ const extractExpression = (
       namespaceStatic.replacements,
       ctx.code
     );
+  }
+
+  const hasStaticCandidatePlan =
+    !isFunction &&
+    !hasNonStaticLocalReference &&
+    (staticImports.length > 0 ||
+      hasInlinableLocalReference ||
+      staticExpressionCode !== undefined);
+  if (evaluate && !hasStaticCandidatePlan && localPureCallHints.size > 0) {
+    const localHints = [...localPureCallHints.values()];
+    const unconditionalHints = localHints.filter((item) => !item.guarded);
+    const hintsToProbe =
+      unconditionalHints.length > 0 ? unconditionalHints : localHints;
+    const pureAnnotatedInvocationSpans = new Set(
+      ctx.pureAnnotatedInvocationSpans
+    );
+    hintsToProbe.forEach(({ hint }) => {
+      pureAnnotatedInvocationSpans.add(`${hint.callStart}:${hint.callEnd}`);
+    });
+    const probeCtx: ExtractionContext = {
+      ...ctx,
+      pureAnnotatedInvocationSpans,
+      staticCallProof: recursiveProof.create(),
+    };
+    if (
+      !expressionHasNestedCallTimeUncertainty(expression, probeCtx) &&
+      literalCode(evaluateStatic(expression, probeCtx)) !== null
+    ) {
+      for (const item of hintsToProbe) {
+        const { hint } = item;
+        hint.actionableWithoutRejection = true;
+      }
+    }
   }
 
   return {
@@ -849,7 +967,11 @@ const extractExpressions = (
       });
       const uniqueMutationGuards = new Map<string, StaticLocalExpression>();
       staticMutationGuards.forEach((guard) => {
-        uniqueMutationGuards.set(guard.source, guard);
+        const hintSpan = guard.pureCallHintSpan;
+        const key = hintSpan
+          ? `${guard.source}\0${hintSpan.start}:${hintSpan.end}`
+          : guard.source;
+        uniqueMutationGuards.set(key, guard);
       });
       ctx.staticValueCandidates.push({
         imports: [...uniqueImports.values()],

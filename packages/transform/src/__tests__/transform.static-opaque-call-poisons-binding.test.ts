@@ -73,25 +73,31 @@ const HEADER = "import { css } from 'test-css-processor';";
 const OBJECT = 'const space = {s12: 12, s16: 16};';
 const SCALAR = 'const s12 = 12;';
 
-const CALL_WHOLE = 'export const opaque = String(space);';
-const CALL_MEMBER = 'export const opaque = String(space.s12);';
-const CALL_OTHER_MEMBER = 'export const opaque = String(space.s16);';
-const CALL_OBJECT_KEYS = 'export const opaque = Object.keys(space);';
+const CALL_WHOLE = 'export const value = String(space);';
+const CALL_IMPORTED_WHOLE = 'opaque(space);';
+const CALL_MEMBER = 'opaque(space.s12);';
+const CALL_OTHER_MEMBER = 'opaque(space.s16);';
+const CALL_OBJECT = 'opaque({ size: space.s12 });';
+const CALL_ARRAY = 'opaque([space.s12, space.s16]);';
+const CALL_NESTED_OBJECT = 'opaque({ space });';
+const CALL_OBJECT_WITH_PRIMITIVE = (value: string) =>
+  `opaque({ size: space.s12, extra: ${value} });`;
+const CALL_OBJECT_KEYS = 'export const value = Object.keys(space);';
 const CALL_OBJECT_FROM_ENTRIES =
-  'export const opaque = Object.fromEntries(Object.entries(space).map(([k, v]) => [v, k]));';
+  'export const value = Object.fromEntries(Object.entries(space).map(([k, v]) => [v, k]));';
 const CALL_ARRAY_METHOD = dedent`
   const scale = [space.s12, space.s16];
-  export const opaque = scale.map((value) => value);
+  export const value = scale.map((item) => item);
 `;
 const CALL_VIA_LOCAL = dedent`
   const wrap = (x: unknown) => String(x);
-  export const opaque = wrap(space);
+  export const value = wrap(space);
 `;
-const CALL_SCALAR = 'export const opaque = String(s12);';
-const CALL_UNRELATED = 'export const opaque = String(1);';
+const CALL_SCALAR = 'export const value = String(s12);';
+const CALL_UNRELATED = 'export const value = String(1);';
 const CALL_STATIC_LOCAL = dedent`
   const f = (x: number) => x;
-  export const opaque = f(space.s12);
+  export const value = f(space.s12);
 `;
 const CALL_IN_FUNCTION = 'export const C = () => String(space);';
 // What a bundler emits for `<Icon size={space.s12} />`. Authored JSX only
@@ -99,7 +105,7 @@ const CALL_IN_FUNCTION = 'export const C = () => String(space);';
 // the real build while its untranspiled source transforms cleanly.
 const CALL_TRANSPILED_JSX = dedent`
   const jsx = (type: unknown, props: unknown) => ({props, type});
-  export const opaque = jsx('div', {size: space.s12});
+  export const value = jsx('div', {size: space.s12});
 `;
 
 const TAG = 'export const a = css`padding: ${space.s12}px;`;';
@@ -107,75 +113,203 @@ const TAG_SCALAR = 'export const a = css`padding: ${s12}px;`;';
 const TAG_LITERAL = 'export const a = css`padding: 12px;`;';
 
 const source = (...parts: string[]) => [HEADER, '', ...parts].join('\n');
+const importedSource = (...parts: string[]) =>
+  [
+    HEADER,
+    "import { opaque } from './runtime';",
+    "import { space } from './tokens';",
+    '',
+    ...parts,
+  ].join('\n');
+const localSource = (...parts: string[]) =>
+  [HEADER, "import { opaque } from './runtime';", '', ...parts].join('\n');
+const importedModules = {
+  'runtime.ts': 'export const opaque = (...values: unknown[]) => values;',
+  'tokens.ts': OBJECT.replace('const ', 'export const '),
+};
+const localModules = {
+  'runtime.ts': importedModules['runtime.ts'],
+};
 
 /**
- * A module-level call the static evaluator cannot fold poisons the *whole*
- * binding it consumes, so a later tag interpolating any member of that binding
- * becomes an unresolvable `_exp`.
+ * Before this fix, a module-level call the static evaluator could not fold
+ * poisoned the whole imported binding even when the call only received an
+ * immutable primitive copied out of it.
  *
- * Three ingredients are jointly required: an object binding, a tag reading one
- * of its members, and an eagerly-evaluated opaque call at module scope that
- * also consumes it. A scalar binding, a call the evaluator can fold, or moving
- * the call into a function body all resolve.
+ * The mutation guard now proves primitive leaves (including leaves copied into
+ * a fresh object or array) at resolution time. Passing the mutable object
+ * itself remains conservative and requires an explicit PURE annotation.
  *
- * Poisoning is per-binding, not per-property: `String(space.s16)` breaks a tag
- * that only reads `space.s12`.
- *
- * Reduced from a design system's toast module, where a `defaultPropsPerType`
- * record built JSX icons at module scope. JSX is not special -- it is merely a
- * common way to get an opaque module-level call, and it reaches this state only
- * once transpiled to `jsx(...)`, so the cases here call `String`/`Object.keys`
- * directly. That file's seven interpolations, including trivial ones like
- * `gap: ${space.s12}px`, all failed that package's Vite build with
- * `eval.strategy: "static" cannot fall back`.
+ * JSX is not special: a transpiled factory call receives the same fresh props
+ * object and is covered by the same capability check.
  */
 describe('static eval with an opaque module-level call consuming the binding', () => {
   const expectResolved = (cssText: string) => {
     expect(cssText).toContain('padding:12px');
   };
 
-  it('resolves when the call takes the whole object', async () => {
-    const result = await runStatic(source(OBJECT, CALL_WHOLE, TAG));
-    expectResolved(result.cssText);
+  it('does not trust a built-in conversion of the whole mutable object', async () => {
+    await expect(runStatic(source(OBJECT, CALL_WHOLE, TAG))).rejects.toThrow(
+      'eval.strategy: "static"'
+    );
   });
 
-  it('resolves when the call takes the same member the tag reads', async () => {
-    const result = await runStatic(source(OBJECT, CALL_MEMBER, TAG));
-    expectResolved(result.cssText);
+  it.each([
+    ['the imported object itself', CALL_IMPORTED_WHOLE],
+    ['a fresh container retaining the imported object', CALL_NESTED_OBJECT],
+  ])('does not resolve when a call receives %s', async (_description, call) => {
+    await expect(
+      runStatic(importedSource(call, TAG), importedModules)
+    ).rejects.toThrow('eval.strategy: "static"');
   });
 
-  it('resolves when the call takes a different member than the tag', async () => {
-    const result = await runStatic(source(OBJECT, CALL_OTHER_MEMBER, TAG));
-    expectResolved(result.cssText);
-  });
-
-  it('resolves with Object.keys as the opaque call', async () => {
-    const result = await runStatic(source(OBJECT, CALL_OBJECT_KEYS, TAG));
-    expectResolved(result.cssText);
-  });
-
-  it('resolves with Object.fromEntries as the opaque call', async () => {
+  it('resolves when an opaque call takes the primitive member the tag reads', async () => {
     const result = await runStatic(
-      source(OBJECT, CALL_OBJECT_FROM_ENTRIES, TAG)
+      importedSource(CALL_MEMBER, TAG),
+      importedModules
     );
     expectResolved(result.cssText);
   });
 
-  // A method call on a derived array reaches the same state as a bare
-  // `String(...)`, so the defect is not tied to the global built-ins above.
-  it('resolves with an array method as the opaque call', async () => {
-    const result = await runStatic(source(OBJECT, CALL_ARRAY_METHOD, TAG));
+  it('resolves when an opaque call takes another primitive member', async () => {
+    const result = await runStatic(
+      importedSource(CALL_OTHER_MEMBER, TAG),
+      importedModules
+    );
     expectResolved(result.cssText);
   });
+
+  it('resolves when a fresh object only contains primitive projections', async () => {
+    const result = await runStatic(
+      importedSource(CALL_OBJECT, TAG),
+      importedModules
+    );
+    expectResolved(result.cssText);
+  });
+
+  it('resolves when a fresh array only contains primitive projections', async () => {
+    const result = await runStatic(
+      importedSource(CALL_ARRAY, TAG),
+      importedModules
+    );
+    expectResolved(result.cssText);
+  });
+
+  it.each([
+    ['a primitive projection', CALL_MEMBER],
+    ['two sequential primitive projections', `${CALL_MEMBER}\n${CALL_MEMBER}`],
+    ['a fresh object of primitive projections', CALL_OBJECT],
+    ['a fresh array of primitive projections', CALL_ARRAY],
+  ])(
+    'resolves a local root constant when an opaque call receives %s',
+    async (_description, call) => {
+      const result = await runStatic(
+        localSource(OBJECT, call, TAG),
+        localModules
+      );
+      expectResolved(result.cssText);
+    }
+  );
+
+  it('does not resolve a local root constant passed as a whole object', async () => {
+    await expect(
+      runStatic(localSource(OBJECT, CALL_IMPORTED_WHOLE, TAG), localModules)
+    ).rejects.toThrow('eval.strategy: "static"');
+  });
+
+  it('does not resolve a local root constant through mutating coercion', async () => {
+    await expect(
+      runStatic(
+        localSource(
+          dedent`
+            const space = {
+              s12: 12,
+              s16: 16,
+              toString() {
+                this.s12 = 24;
+                return 'space';
+              },
+            };
+          `,
+          'opaque(`${space}`);',
+          TAG
+        ),
+        localModules
+      )
+    ).rejects.toThrow('eval.strategy: "static"');
+  });
+
+  it.each([
+    ['undefined', 'undefined'],
+    ['NaN', 'NaN'],
+    ['Infinity', 'Infinity'],
+    ['a negative numeric literal', '-1'],
+    ['a template built from a primitive projection', '`${space.s12}px`'],
+    ['a binary primitive expression', 'space.s12 + 1'],
+    ['a logical primitive expression', 'space.s12 || 1'],
+    ['a conditional primitive expression', 'true ? space.s12 : 1'],
+  ])(
+    'resolves when a fresh object also contains %s',
+    async (_description, value) => {
+      const result = await runStatic(
+        importedSource(CALL_OBJECT_WITH_PRIMITIVE(value), TAG),
+        importedModules
+      );
+      expectResolved(result.cssText);
+    }
+  );
+
+  it.each([
+    ['template coercion', '`${space}px`'],
+    ['binary coercion', 'space + ""'],
+    ['unary coercion', '+space'],
+    ['a logical object result', 'space || 1'],
+    ['a conditional object result', 'true ? space : 1'],
+  ])(
+    'does not allow %s through a fresh container',
+    async (_description, value) => {
+      await expect(
+        runStatic(
+          importedSource(CALL_OBJECT_WITH_PRIMITIVE(value), TAG),
+          importedModules
+        )
+      ).rejects.toThrow('eval.strategy: "static"');
+    }
+  );
+
+  it.each(['undefined', 'NaN', 'Infinity'])(
+    'does not mistake a shadowed %s binding for the global primitive',
+    async (name) => {
+      await expect(
+        runStatic(
+          importedSource(
+            `const ${name} = space;`,
+            CALL_OBJECT_WITH_PRIMITIVE(name),
+            TAG
+          ),
+          importedModules
+        )
+      ).rejects.toThrow('eval.strategy: "static"');
+    }
+  );
 
   it('resolves with a transpiled JSX factory call', async () => {
-    const result = await runStatic(source(OBJECT, CALL_TRANSPILED_JSX, TAG));
+    const result = await runStatic(
+      importedSource(CALL_TRANSPILED_JSX, TAG),
+      importedModules
+    );
     expectResolved(result.cssText);
   });
 
-  it('resolves when the opaque call is wrapped in a local function', async () => {
-    const result = await runStatic(source(OBJECT, CALL_VIA_LOCAL, TAG));
-    expectResolved(result.cssText);
+  it.each([
+    ['Object.keys', CALL_OBJECT_KEYS],
+    ['Object.fromEntries', CALL_OBJECT_FROM_ENTRIES],
+    ['an array method', CALL_ARRAY_METHOD],
+    ['a local helper', CALL_VIA_LOCAL],
+  ])('does not infer that %s is read-only', async (_description, call) => {
+    await expect(runStatic(source(OBJECT, call, TAG))).rejects.toThrow(
+      'eval.strategy: "static"'
+    );
   });
 
   // Controls: each drops or moves one ingredient and passes today.
@@ -279,6 +413,27 @@ describe('static eval with an opaque module-level call consuming the binding', (
     expectResolved(result.cssText);
   });
 
+  it('applies a PURE annotation to calls that compute a chained callee', async () => {
+    const result = await runStatic(
+      dedent`
+        ${HEADER}
+        import { factory } from './runtime';
+        import { space } from './tokens';
+
+        /*#__PURE__*/ factory(space)();
+        ${TAG}
+      `,
+      {
+        'runtime.ts': dedent`
+          export const factory = (value: unknown) => () => String(value);
+        `,
+        'tokens.ts': OBJECT.replace('const ', 'export const '),
+      }
+    );
+
+    expectResolved(result.cssText);
+  });
+
   it('keeps the result of an annotated opaque call non-static', async () => {
     try {
       await runStatic(
@@ -323,6 +478,34 @@ describe('static eval with an opaque module-level call consuming the binding', (
           'tokens.ts': OBJECT.replace('const ', 'export const '),
         }
       )
-    ).rejects.toThrow('an earlier call may mutate an imported value');
+    ).rejects.toThrow(
+      'an earlier call may mutate a value used by this interpolation'
+    );
+  });
+
+  it('does not hide an opaque call in a deferred callee callback', async () => {
+    await expect(
+      runStatic(
+        dedent`
+          ${HEADER}
+          import { factory, mutate } from './runtime';
+          import { space } from './tokens';
+
+          export const run = /*#__PURE__*/ factory(() => {
+            mutate(space);
+            return css\`padding: ${'${space.s12}'}px;\`;
+          })();
+        `,
+        {
+          'runtime.ts': dedent`
+            export const factory = (callback: () => unknown) => callback;
+            export const mutate = (value: unknown) => value;
+          `,
+          'tokens.ts': OBJECT.replace('const ', 'export const '),
+        }
+      )
+    ).rejects.toThrow(
+      'an earlier call may mutate a value used by this interpolation'
+    );
   });
 });

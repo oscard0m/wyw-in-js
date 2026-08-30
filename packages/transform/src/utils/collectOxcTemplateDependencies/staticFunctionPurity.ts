@@ -1,14 +1,10 @@
 import type { Node } from 'oxc-parser';
 
+import { getOxcNodeChildren } from '../oxc/ast';
 import { collectOxcPatternRuntimeExpressions } from '../oxc/patterns';
 import { isOxcFunctionLike } from '../oxc/runtimeSemantics';
 
-type IsReadOnlyCall = (node: Node) => boolean;
-
-const isDirectReadOnlyExpression = (
-  node: Node,
-  isReadOnlyCall: IsReadOnlyCall
-): boolean => {
+const isDirectReadOnlyExpression = (node: Node): boolean => {
   if (
     node.type === 'TSAsExpression' ||
     node.type === 'TSSatisfiesExpression' ||
@@ -17,56 +13,22 @@ const isDirectReadOnlyExpression = (
     node.type === 'TSTypeAssertion' ||
     node.type === 'ParenthesizedExpression'
   ) {
-    return isDirectReadOnlyExpression(node.expression, isReadOnlyCall);
+    return isDirectReadOnlyExpression(node.expression);
   }
 
-  if (node.type === 'Identifier' || node.type === 'Literal') {
-    return true;
-  }
-
-  if (node.type === 'ObjectExpression') {
-    return node.properties.every((property) => {
-      if (property.type === 'SpreadElement' || property.method) {
-        return false;
-      }
-
-      return (
-        (!property.computed ||
-          isDirectReadOnlyExpression(property.key, isReadOnlyCall)) &&
-        isDirectReadOnlyExpression(property.value, isReadOnlyCall)
-      );
-    });
-  }
-
-  if (node.type === 'ArrayExpression') {
-    return node.elements.every(
-      (element) =>
-        !element ||
-        (element.type !== 'SpreadElement' &&
-          isDirectReadOnlyExpression(element, isReadOnlyCall))
-    );
-  }
-
-  if (node.type === 'CallExpression') {
-    return (
-      !node.arguments.some((argument) => argument.type === 'SpreadElement') &&
-      isReadOnlyCall(node) &&
-      node.arguments.every(
-        (argument) =>
-          argument.type !== 'SpreadElement' &&
-          isDirectReadOnlyExpression(argument, isReadOnlyCall)
-      )
-    );
-  }
-
-  return false;
+  return node.type === 'Identifier' || node.type === 'Literal';
 };
 
-export const isReadOnlyOpaqueFunction = (
-  node: Node,
-  isReadOnlyCall: IsReadOnlyCall = () => false
-): boolean => {
+const readOnlyOpaqueFunctionCache = new WeakMap<Node, boolean>();
+
+export const isReadOnlyOpaqueFunction = (node: Node): boolean => {
+  const cached = readOnlyOpaqueFunctionCache.get(node);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   if (!isOxcFunctionLike(node)) {
+    readOnlyOpaqueFunctionCache.set(node, false);
     return false;
   }
 
@@ -75,25 +37,30 @@ export const isReadOnlyOpaqueFunction = (
       (param) => collectOxcPatternRuntimeExpressions(param).length > 0
     )
   ) {
+    readOnlyOpaqueFunctionCache.set(node, false);
     return false;
   }
 
   const { body } = node;
   if (!body) {
+    readOnlyOpaqueFunctionCache.set(node, false);
     return false;
   }
   if (body.type !== 'BlockStatement') {
-    return isDirectReadOnlyExpression(body, isReadOnlyCall);
+    const result = isDirectReadOnlyExpression(body);
+    readOnlyOpaqueFunctionCache.set(node, result);
+    return result;
   }
 
-  return body.body.every(
+  const result = getOxcNodeChildren(body).every(
     (statement) =>
       statement.type === 'EmptyStatement' ||
       (statement.type === 'ExpressionStatement' &&
         statement.expression.type === 'Literal' &&
         typeof statement.expression.value === 'string') ||
       (statement.type === 'ReturnStatement' &&
-        (!statement.argument ||
-          isDirectReadOnlyExpression(statement.argument, isReadOnlyCall)))
+        (!statement.argument || isDirectReadOnlyExpression(statement.argument)))
   );
+  readOnlyOpaqueFunctionCache.set(node, result);
+  return result;
 };

@@ -6,10 +6,7 @@ import {
   collectOxcPatternBindingNames,
   collectOxcPatternRuntimeExpressions,
 } from '../oxc/patterns';
-import {
-  isOxcFunctionLike,
-  unwrapOxcRuntimeExpression,
-} from '../oxc/runtimeSemantics';
+import { isOxcFunctionLike } from '../oxc/runtimeSemantics';
 import { lookupStaticBinding } from './staticBindings';
 import { isReadOnlyOpaqueFunction } from './staticFunctionPurity';
 import {
@@ -65,153 +62,6 @@ import type { ExtractionContext } from './types';
 
 export { createOxcStaticCallableValue } from './staticEvaluationRuntime';
 
-// Unbound platform intrinsics use their standard non-mutating semantics. Code
-// that monkey-patches globals or built-in prototypes is outside the static
-// evaluator's guarantees, just like other ambient writes.
-const readOnlyIntrinsicCalls = new Set(['Boolean', 'Number', 'String']);
-const readOnlyObjectCalls = new Set([
-  'entries',
-  'fromEntries',
-  'keys',
-  'values',
-]);
-const readOnlyArrayCreatingObjectCalls = new Set(['entries', 'keys', 'values']);
-
-const getStaticMemberName = (node: Node): string | null => {
-  const unwrapped = unwrapOxcRuntimeExpression(node, false);
-  if (unwrapped.type !== 'MemberExpression' || unwrapped.optional) {
-    return null;
-  }
-  if (!unwrapped.computed && unwrapped.property.type === 'Identifier') {
-    return unwrapped.property.name;
-  }
-  if (
-    unwrapped.computed &&
-    unwrapped.property.type === 'Literal' &&
-    typeof unwrapped.property.value === 'string'
-  ) {
-    return unwrapped.property.value;
-  }
-  return null;
-};
-
-const isUnboundIntrinsic = (
-  node: Node,
-  name: string,
-  ctx: ExtractionContext
-): boolean => {
-  const unwrapped = unwrapOxcRuntimeExpression(node, false);
-  return (
-    unwrapped.type === 'Identifier' &&
-    unwrapped.name === name &&
-    !resolveBindingAt(ctx, name, unwrapped.start)
-  );
-};
-
-const isReadOnlyObjectCall = (
-  node: Extract<Node, { type: 'CallExpression' }>,
-  ctx: ExtractionContext
-): boolean => {
-  const callee = unwrapOxcRuntimeExpression(node.callee, false);
-  return (
-    callee.type === 'MemberExpression' &&
-    !callee.optional &&
-    isUnboundIntrinsic(callee.object, 'Object', ctx) &&
-    readOnlyObjectCalls.has(getStaticMemberName(callee) ?? '')
-  );
-};
-
-const resolveReadOnlyFunction = (
-  node: Node,
-  callStart: number,
-  ctx: ExtractionContext
-): Node | null => {
-  const unwrapped = unwrapOxcRuntimeExpression(node, false);
-  if (isOxcFunctionLike(unwrapped)) {
-    return unwrapped;
-  }
-  if (unwrapped.type !== 'Identifier') {
-    return null;
-  }
-
-  const binding = resolveBindingAt(ctx, unwrapped.name, unwrapped.start);
-  const fn = binding?.functionNode ?? binding?.declarator?.init;
-  if (
-    !fn ||
-    !isOxcFunctionLike(fn) ||
-    (binding?.declarator && binding.declarator.end > callStart)
-  ) {
-    return null;
-  }
-  return fn;
-};
-
-const isKnownArrayReceiver = (
-  node: Node,
-  callStart: number,
-  ctx: ExtractionContext
-): boolean => {
-  const unwrapped = unwrapOxcRuntimeExpression(node, false);
-  if (unwrapped.type === 'ArrayExpression') {
-    return true;
-  }
-  if (unwrapped.type === 'CallExpression') {
-    const callee = unwrapOxcRuntimeExpression(unwrapped.callee, false);
-    return (
-      callee.type === 'MemberExpression' &&
-      isUnboundIntrinsic(callee.object, 'Object', ctx) &&
-      readOnlyArrayCreatingObjectCalls.has(getStaticMemberName(callee) ?? '')
-    );
-  }
-  if (unwrapped.type !== 'Identifier') {
-    return false;
-  }
-
-  const binding = resolveBindingAt(ctx, unwrapped.name, unwrapped.start);
-  if (
-    !binding?.declarator?.init ||
-    binding.declarator.end > callStart ||
-    hasDirectBindingMutationBefore(binding, callStart, ctx)
-  ) {
-    return false;
-  }
-  return (
-    unwrapOxcRuntimeExpression(binding.declarator.init, false).type ===
-    'ArrayExpression'
-  );
-};
-
-const isReadOnlyArrayMapCall = (
-  node: Extract<Node, { type: 'CallExpression' }>,
-  ctx: ExtractionContext,
-  env: EvalEnv
-): boolean => {
-  const callee = unwrapOxcRuntimeExpression(node.callee, false);
-  if (
-    callee.type !== 'MemberExpression' ||
-    callee.optional ||
-    getStaticMemberName(callee) !== 'map' ||
-    !isKnownArrayReceiver(callee.object, node.start, ctx) ||
-    node.arguments.length !== 1
-  ) {
-    return false;
-  }
-
-  // Native map leaves its receiver intact. The callback is the remaining
-  // capability that can perform a write, so prove its body independently.
-  const [callback] = node.arguments;
-  if (!callback || callback.type === 'SpreadElement') {
-    return false;
-  }
-  const fn = resolveReadOnlyFunction(callback, node.start, ctx);
-  return (
-    !!fn &&
-    isReadOnlyOpaqueFunction(fn, (call) =>
-      isKnownPureStaticCall(call, ctx, env)
-    )
-  );
-};
-
 export const isKnownPureStaticCall = (
   node: Node,
   ctx: ExtractionContext,
@@ -238,29 +88,11 @@ export const isKnownPureStaticCall = (
     return true;
   }
 
-  if (
-    node.type !== 'CallExpression' ||
-    node.arguments.some((argument) => argument.type === 'SpreadElement')
-  ) {
+  if (node.type !== 'CallExpression' || node.callee.type !== 'Identifier') {
     return false;
   }
 
-  const callee = unwrapOxcRuntimeExpression(node.callee, false);
-  if (
-    callee.type === 'Identifier' &&
-    readOnlyIntrinsicCalls.has(callee.name) &&
-    !resolveBindingAt(ctx, callee.name, callee.start)
-  ) {
-    return true;
-  }
-  if (isReadOnlyObjectCall(node, ctx)) {
-    return true;
-  }
-
-  const binding =
-    callee.type === 'Identifier'
-      ? resolveBindingAt(ctx, callee.name, callee.start)
-      : null;
+  const binding = resolveBindingAt(ctx, node.callee.name, node.callee.start);
   if (binding?.importedFrom) {
     const override = lookupStaticBinding(
       ctx.staticBindings,
@@ -270,20 +102,20 @@ export const isKnownPureStaticCall = (
     return override.found && typeof override.value === 'function';
   }
 
-  const fn =
-    callee.type === 'Identifier'
-      ? binding?.functionNode ?? binding?.declarator?.init
-      : null;
+  const fn = binding?.functionNode ?? binding?.declarator?.init;
   if (
-    callee.type === 'Identifier' &&
-    (!fn ||
-      !isOxcFunctionLike(fn) ||
-      (binding?.declarator && binding.declarator.end > node.start))
+    !fn ||
+    !isOxcFunctionLike(fn) ||
+    (binding?.declarator && binding.declarator.end > node.start) ||
+    node.arguments.some((argument) => argument.type === 'SpreadElement')
   ) {
     return false;
   }
-  if (callee.type !== 'Identifier' && callee.type !== 'MemberExpression') {
-    return false;
+
+  // An opaque return value is distinct from an impure invocation. A helper
+  // that only returns a direct read cannot mutate sibling imports.
+  if (isReadOnlyOpaqueFunction(fn)) {
+    return true;
   }
 
   const proofEnv = env ?? new Map();
@@ -301,23 +133,6 @@ export const isKnownPureStaticCall = (
       ),
       staticCallProof: recursiveProof.partial(ctx.staticCallProof),
     };
-
-    if (callee.type === 'MemberExpression') {
-      return isReadOnlyArrayMapCall(node, proofCtx, proofEnv);
-    }
-
-    // An opaque return value is distinct from an impure invocation. A helper
-    // whose body only constructs values or delegates to read-only calls cannot
-    // mutate capabilities received through its arguments.
-    if (
-      fn &&
-      isReadOnlyOpaqueFunction(fn, (call) =>
-        isKnownPureStaticCall(call, proofCtx, proofEnv)
-      )
-    ) {
-      return true;
-    }
-
     const isScalar = (value: unknown): boolean =>
       value === null ||
       typeof value === 'string' ||

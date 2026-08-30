@@ -23,6 +23,7 @@ import {
 import {
   getMutationTimeline,
   hasTimelineStartBefore,
+  resolveBindingAt,
   toMutationBindingKey,
   unknownAliasMutationBinding,
 } from './scopeAnalysis';
@@ -119,7 +120,8 @@ export const hasReferencedRootMutationBefore = (
   referenceStart: number,
   ctx: ExtractionContext,
   ignoredReferences: ReadonlySet<string> = new Set(),
-  ignoredHazard?: Node
+  ignoredHazard?: Node,
+  guardedHazards: ReadonlySet<Node> = new Set()
 ): boolean =>
   getReferences(expression, ctx.bindingIndex).some(
     ({ binding: dependency, name }) => {
@@ -142,6 +144,7 @@ export const hasReferencedRootMutationBefore = (
           referenceStart,
           ctx,
           (hazard) =>
+            !guardedHazards.has(hazard) &&
             !isKnownPureStaticCall(hazard, ctx) &&
             (!ignoredHazard ||
               hazard.start < ignoredHazard.start ||
@@ -175,7 +178,10 @@ export const collectBindingMutationGuardsBefore = (
   binding: Binding,
   referenceStart: number,
   ctx: ExtractionContext,
-  onOpaqueInvocation?: (hazard: Node) => void
+  onOpaqueInvocation?: (
+    hazard: Node,
+    guards: readonly Expression[] | null
+  ) => void
 ): readonly Expression[] | null => {
   const bindingKey = toMutationBindingKey(binding);
   if (
@@ -197,13 +203,12 @@ export const collectBindingMutationGuardsBefore = (
         return false;
       }
 
-      if (hazard.type === 'CallExpression' || hazard.type === 'NewExpression') {
-        onOpaqueInvocation?.(hazard);
-      }
-
       const guards = ctx.rootMutationHazardGuardsByBinding
         .get(bindingKey)
         ?.get(hazard);
+      if (hazard.type === 'CallExpression' || hazard.type === 'NewExpression') {
+        onOpaqueInvocation?.(hazard, guards ?? null);
+      }
       if (!guards || guards.length === 0) {
         return true;
       }
@@ -219,13 +224,15 @@ export const collectBindingMutationGuardsBefore = (
 export const hasOpaqueDestructuringHazardBefore = (
   bindingKey: string,
   referenceStart: number,
-  ctx: ExtractionContext
+  ctx: ExtractionContext,
+  guardedHazards: ReadonlySet<Node> = new Set()
 ): boolean =>
   someHazardTimelineEndAtOrBefore(
     getHazardTimelineAt(bindingKey, referenceStart, ctx),
     referenceStart,
     ctx,
-    (hazard) => isOpaqueDestructuringHazard(hazard, ctx)
+    (hazard) =>
+      !guardedHazards.has(hazard) && isOpaqueDestructuringHazard(hazard, ctx)
   );
 
 const hasFunctionContextSyntax = (node: Node): boolean =>
@@ -367,7 +374,8 @@ function collectStaticLocalExpression(
   expression: Expression,
   ctx: ExtractionContext,
   stack: string[] = [],
-  ignoredReferences: ReadonlySet<string> = new Set()
+  ignoredReferences: ReadonlySet<string> = new Set(),
+  guardedHazards: ReadonlySet<Node> = new Set()
 ): StaticLocalExpression | null {
   const exactReplacements = new Map<number, string>();
   const importedFrom = new Set<string>();
@@ -419,7 +427,13 @@ function collectStaticLocalExpression(
       continue;
     }
 
-    const nested = collectStaticBindingExpression(binding, start, ctx, stack);
+    const nested = collectStaticBindingExpression(
+      binding,
+      start,
+      ctx,
+      stack,
+      guardedHazards
+    );
     if (!nested) {
       return null;
     }
@@ -468,16 +482,159 @@ const isStaticMutationGuardProjection = (node: Node): boolean => {
   );
 };
 
-export const collectStaticMutationGuardExpressions = (
+const immutableGlobalPrimitives = new Set(['Infinity', 'NaN', 'undefined']);
+
+const primitiveBinaryOperators = new Set([
+  '!=',
+  '!==',
+  '%',
+  '&',
+  '*',
+  '**',
+  '+',
+  '-',
+  '/',
+  '<',
+  '<<',
+  '<=',
+  '==',
+  '===',
+  '>',
+  '>=',
+  '>>',
+  '>>>',
+  '^',
+  '|',
+]);
+
+const collectStaticPrimitiveMutationGuardExpressions = (
   expression: Expression,
-  ctx: ExtractionContext
+  ctx: ExtractionContext,
+  guardedHazards: ReadonlySet<Node>
 ): StaticLocalExpression[] | null => {
   const unwrapped = unwrapOxcRuntimeExpression(expression, false);
+  if (
+    unwrapped.type === 'Identifier' &&
+    immutableGlobalPrimitives.has(unwrapped.name) &&
+    !resolveBindingAt(ctx, unwrapped.name, unwrapped.start)
+  ) {
+    return [];
+  }
+
   if (isStaticMutationGuardProjection(unwrapped)) {
-    const guard = collectStaticLocalExpression(unwrapped as Expression, ctx);
+    const guard = collectStaticLocalExpression(
+      unwrapped as Expression,
+      ctx,
+      [],
+      new Set(),
+      guardedHazards
+    );
     return guard ? [guard] : null;
   }
 
+  if (unwrapped.type === 'Literal') {
+    return unwrapped.value === null || typeof unwrapped.value !== 'object'
+      ? []
+      : null;
+  }
+
+  if (unwrapped.type === 'UnaryExpression' && unwrapped.operator !== 'delete') {
+    return collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.argument as Expression,
+      ctx,
+      guardedHazards
+    );
+  }
+
+  if (unwrapped.type === 'TemplateLiteral') {
+    const guards: StaticLocalExpression[] = [];
+    for (const substitution of unwrapped.expressions) {
+      const substitutionGuards = collectStaticPrimitiveMutationGuardExpressions(
+        substitution,
+        ctx,
+        guardedHazards
+      );
+      if (!substitutionGuards) {
+        return null;
+      }
+      guards.push(...substitutionGuards);
+    }
+    return guards;
+  }
+
+  if (
+    unwrapped.type === 'BinaryExpression' &&
+    primitiveBinaryOperators.has(unwrapped.operator)
+  ) {
+    const leftGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.left as Expression,
+      ctx,
+      guardedHazards
+    );
+    const rightGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.right as Expression,
+      ctx,
+      guardedHazards
+    );
+    return leftGuards && rightGuards ? [...leftGuards, ...rightGuards] : null;
+  }
+
+  if (unwrapped.type === 'LogicalExpression') {
+    const leftGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.left,
+      ctx,
+      guardedHazards
+    );
+    const rightGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.right,
+      ctx,
+      guardedHazards
+    );
+    return leftGuards && rightGuards ? [...leftGuards, ...rightGuards] : null;
+  }
+
+  if (unwrapped.type === 'ConditionalExpression') {
+    const testGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.test,
+      ctx,
+      guardedHazards
+    );
+    const consequentGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.consequent,
+      ctx,
+      guardedHazards
+    );
+    const alternateGuards = collectStaticPrimitiveMutationGuardExpressions(
+      unwrapped.alternate,
+      ctx,
+      guardedHazards
+    );
+    return testGuards && consequentGuards && alternateGuards
+      ? [...testGuards, ...consequentGuards, ...alternateGuards]
+      : null;
+  }
+
+  return null;
+};
+
+export const collectStaticMutationGuardExpressions = (
+  expression: Expression,
+  ctx: ExtractionContext,
+  guardedHazards: ReadonlySet<Node> = new Set()
+): StaticLocalExpression[] | null => {
+  const unwrapped = unwrapOxcRuntimeExpression(expression, false);
+  const primitiveGuards = collectStaticPrimitiveMutationGuardExpressions(
+    unwrapped as Expression,
+    ctx,
+    guardedHazards
+  );
+  if (primitiveGuards) {
+    return primitiveGuards;
+  }
+
+  // RegExp literals are fresh mutable values rather than primitives, but they
+  // still carry no capability back to a source binding when copied into a
+  // newly constructed argument.
   if (unwrapped.type === 'Literal') {
     return [];
   }
@@ -494,9 +651,10 @@ export const collectStaticMutationGuardExpressions = (
       }
 
       if (property.computed) {
-        const keyGuards = collectStaticMutationGuardExpressions(
+        const keyGuards = collectStaticPrimitiveMutationGuardExpressions(
           property.key as Expression,
-          ctx
+          ctx,
+          guardedHazards
         );
         if (!keyGuards) {
           return null;
@@ -506,7 +664,8 @@ export const collectStaticMutationGuardExpressions = (
 
       const valueGuards = collectStaticMutationGuardExpressions(
         property.value,
-        ctx
+        ctx,
+        guardedHazards
       );
       if (!valueGuards) {
         return null;
@@ -526,7 +685,11 @@ export const collectStaticMutationGuardExpressions = (
         return null;
       }
 
-      const elementGuards = collectStaticMutationGuardExpressions(element, ctx);
+      const elementGuards = collectStaticMutationGuardExpressions(
+        element,
+        ctx,
+        guardedHazards
+      );
       if (!elementGuards) {
         return null;
       }
@@ -542,7 +705,8 @@ function collectStaticDestructuringProjection(
   binding: Binding,
   referenceStart: number,
   ctx: ExtractionContext,
-  stack: string[]
+  stack: string[],
+  guardedHazards: ReadonlySet<Node>
 ): StaticLocalExpression | null {
   const { declarator } = binding;
   if (
@@ -567,7 +731,8 @@ function collectStaticDestructuringProjection(
     hasOpaqueDestructuringHazardBefore(
       unknownAliasMutationBinding,
       referenceStart,
-      ctx
+      ctx,
+      guardedHazards
     )
   ) {
     return null;
@@ -594,7 +759,8 @@ function collectStaticDestructuringProjection(
       targetMutationHazards,
       referenceStart,
       ctx,
-      (hazard) => isOpaqueDestructuringHazard(hazard, ctx)
+      (hazard) =>
+        !guardedHazards.has(hazard) && isOpaqueDestructuringHazard(hazard, ctx)
     )
   ) {
     return null;
@@ -616,7 +782,8 @@ function collectStaticDestructuringProjection(
           hasOpaqueDestructuringHazardBefore(
             toMutationBindingKey(dependency),
             declarator.start,
-            ctx
+            ctx,
+            guardedHazards
           ))
       );
     })
@@ -626,7 +793,9 @@ function collectStaticDestructuringProjection(
   const initializer = collectStaticLocalExpression(
     declarator.init,
     snapshotCtx,
-    stack
+    stack,
+    new Set(),
+    guardedHazards
   );
   if (!initializer) {
     return null;
@@ -642,7 +811,9 @@ function collectStaticDestructuringProjection(
         expression,
         referenceStart,
         ctx,
-        localBindingNames
+        localBindingNames,
+        undefined,
+        guardedHazards
       )
     ) {
       return null;
@@ -652,7 +823,8 @@ function collectStaticDestructuringProjection(
       expression,
       snapshotCtx,
       stack,
-      localBindingNames
+      localBindingNames,
+      guardedHazards
     );
     if (!resolved) {
       return null;
@@ -684,7 +856,8 @@ export function collectStaticBindingExpression(
   binding: Binding,
   referenceStart: number,
   ctx: ExtractionContext,
-  stack: string[] = []
+  stack: string[] = [],
+  guardedHazards: ReadonlySet<Node> = new Set()
 ): StaticLocalExpression | null {
   const { declarator } = binding;
   if (
@@ -701,7 +874,8 @@ export function collectStaticBindingExpression(
     hasOpaqueDestructuringHazardBefore(
       toMutationBindingKey(binding),
       referenceStart,
-      ctx
+      ctx,
+      guardedHazards
     )
   ) {
     return null;
@@ -731,21 +905,29 @@ export function collectStaticBindingExpression(
       referenceStart,
       ctx,
       new Set(countPatternBindingNames(declarator.id).keys()),
-      declarator
+      declarator,
+      guardedHazards
     )
   ) {
     return null;
   }
 
   if (declarator.id.type === 'Identifier') {
-    return collectStaticLocalExpression(declarator.init, ctx, nextStack);
+    return collectStaticLocalExpression(
+      declarator.init,
+      ctx,
+      nextStack,
+      new Set(),
+      guardedHazards
+    );
   }
 
   return collectStaticDestructuringProjection(
     binding,
     referenceStart,
     ctx,
-    nextStack
+    nextStack,
+    guardedHazards
   );
 }
 

@@ -168,7 +168,9 @@ describe('static eval of css tags declared after a module-level cx()', () => {
 
     await expect(
       runStatic(source(CX_WITHOUT_CSS, FIRST, SECOND), tokens)
-    ).rejects.toThrow('an earlier call may mutate an imported value');
+    ).rejects.toThrow(
+      'an earlier call may mutate a value used by this interpolation'
+    );
   });
 
   it('keeps an accessor member argument hazardous', async () => {
@@ -188,6 +190,8 @@ describe('static eval of css tags declared after a module-level cx()', () => {
 
     await expect(
       runStatic(source(CX_WITHOUT_CSS, FIRST, SECOND), tokens)
-    ).rejects.toThrow('an earlier call may mutate an imported value');
+    ).rejects.toThrow(
+      'an earlier call may mutate a value used by this interpolation'
+    );
   });
 });

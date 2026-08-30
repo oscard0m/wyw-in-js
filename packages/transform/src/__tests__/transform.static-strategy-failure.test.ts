@@ -8,6 +8,8 @@ import {
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
 
+import { SourceMapGenerator, type RawSourceMap } from 'source-map';
+
 import { TransformCacheCollection } from '../cache';
 import { transform } from '../transform';
 
@@ -29,16 +31,22 @@ const createResolver = () => async (what: string, importer: string) => {
   return null;
 };
 
-const runStatic = (root: string, entryFile: string) =>
+const runStatic = (
+  root: string,
+  entryFile: string,
+  inputSourceMap?: RawSourceMap,
+  strategy: 'hybrid' | 'static' = 'static'
+) =>
   transform(
     {
       cache: new TransformCacheCollection(),
       options: {
         filename: entryFile,
+        inputSourceMap,
         root,
         pluginOptions: {
           configFile: false,
-          eval: { strategy: 'static' },
+          eval: { strategy },
           tagResolver: (s: string, t: string) =>
             s === 'test-css-processor' && t === 'css' ? processorFile : null,
         },
@@ -225,6 +233,300 @@ describe('eval.strategy "static" failure diagnostics', () => {
       expect(message).toContain('/*#__PURE__*/ factory()(space)');
       expect(message).toContain('side-effect-free');
       expect(message.split('/*#__PURE__*/ factory()(space)')).toHaveLength(2);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('points to an opaque call that prevents resolving a local binding', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'runtime.js'),
+      `export const opaque = (value) => String(value);`
+    );
+    writeFileSync(
+      entryFile,
+      [
+        `import { css } from 'test-css-processor';`,
+        `import { opaque } from './runtime.js';`,
+        `const space = { medium: 12 };`,
+        `opaque(space);`,
+        'export const className = css`padding: ${space.medium}px;`;',
+      ].join('\n')
+    );
+
+    try {
+      await runStatic(root, entryFile);
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).toContain(`${entryFile}:4:1`);
+      expect(message).toContain('/*#__PURE__*/ opaque(space)');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves the local binding after applying the suggested PURE annotation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'runtime.js'),
+      `export const opaque = (value) => String(value);`
+    );
+    writeFileSync(
+      entryFile,
+      [
+        `import { css } from 'test-css-processor';`,
+        `import { opaque } from './runtime.js';`,
+        `const space = { medium: 12 };`,
+        `/*#__PURE__*/ opaque(space);`,
+        'export const className = css`padding: ${space.medium}px;`;',
+      ].join('\n')
+    );
+
+    try {
+      const result = await runStatic(root, entryFile);
+      expect(result.cssText).toContain('padding:12px');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not suggest a local call when annotating it would not resolve the value', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'runtime.js'),
+      `export const opaque = (value) => String(value);`
+    );
+    const writeEntry = (annotation = '') =>
+      writeFileSync(
+        entryFile,
+        [
+          `import { css } from 'test-css-processor';`,
+          `import { opaque } from './runtime.js';`,
+          `const space = makeSpace();`,
+          `${annotation}opaque(space);`,
+          'export const className = css`padding: ${space.medium}px;`;',
+        ].join('\n')
+      );
+    writeEntry();
+
+    try {
+      let failure: unknown;
+      try {
+        await runStatic(root, entryFile);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(Error);
+      const { message } = failure as Error;
+      expect(message).not.toContain('Calls that may be safe to annotate');
+      expect(message).not.toContain('/*#__PURE__*/ opaque(space)');
+
+      writeEntry('/*#__PURE__*/ ');
+      await expect(runStatic(root, entryFile)).rejects.toThrow(
+        'eval.strategy: "static"'
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not surface PURE hints when hybrid fallback is available', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'runtime.js'),
+      `export const opaque = (value) => String(value);`
+    );
+    writeFileSync(
+      entryFile,
+      [
+        `import { css } from 'test-css-processor';`,
+        `import { opaque } from './runtime.js';`,
+        `const space = { medium: 12 };`,
+        `opaque(space);`,
+        'export const className = css`padding: ${space.medium}px;`;',
+      ].join('\n')
+    );
+
+    try {
+      const result = await runStatic(root, entryFile, undefined, 'hybrid');
+      expect(result.cssText).toContain('padding:12px');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('only points to the mutation guard that actually failed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'tokens.js'),
+      [
+        `export const alias = { className: 'safe', nested: {} };`,
+        `export const source = { width: 12 };`,
+      ].join('\n')
+    );
+    writeFileSync(
+      entryFile,
+      [
+        `import { css } from 'test-css-processor';`,
+        `import { alias, source } from './tokens.js';`,
+        `mutate(alias.className);`,
+        `mutate(alias.nested);`,
+        'export const className = css`width: ${source.width}px;`;',
+      ].join('\n')
+    );
+
+    try {
+      await runStatic(root, entryFile);
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).toContain('/*#__PURE__*/ mutate(alias.nested)');
+      expect(message).not.toContain('/*#__PURE__*/ mutate(alias.className)');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('omits guardable calls when an unconditional receiver call blocks extraction', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    writeFileSync(
+      join(root, 'tokens.js'),
+      [
+        `export const alias = { className: 'safe', width: 12, method() {} };`,
+      ].join('\n')
+    );
+    writeFileSync(
+      entryFile,
+      [
+        `import { css } from 'test-css-processor';`,
+        `import { alias } from './tokens.js';`,
+        `mutate(alias.className);`,
+        `alias.method();`,
+        'export const className = css`width: ${alias.width}px;`;',
+      ].join('\n')
+    );
+
+    try {
+      await runStatic(root, entryFile);
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).toContain('/*#__PURE__*/ alias.method()');
+      expect(message).not.toContain('/*#__PURE__*/ mutate(alias.className)');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('maps a PURE hint through a sparse map with no exact end segment', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    const originalFile = join(root, 'entry.tsx');
+    const originalSource = [
+      `import { css } from 'test-css-processor';`,
+      `import { factory } from './runtime.js';`,
+      `import { space } from './tokens.js';`,
+      `factory()(space);`,
+      'export const className = css`padding: ${space.medium}px;`;',
+    ].join('\n');
+    const generatedSource = `// generated\n${originalSource}`;
+    const sourceMap = new SourceMapGenerator({ file: entryFile });
+    originalSource.split('\n').forEach((line, index) => {
+      sourceMap.addMapping({
+        generated: { column: 0, line: index + 2 },
+        original: { column: 0, line: index + 1 },
+        source: originalFile,
+      });
+      sourceMap.addMapping({
+        generated: {
+          column:
+            line === 'factory()(space);' ? 'factory()('.length : line.length,
+          line: index + 2,
+        },
+        original: {
+          column:
+            line === 'factory()(space);' ? 'factory()('.length : line.length,
+          line: index + 1,
+        },
+        source: originalFile,
+      });
+    });
+    sourceMap.setSourceContent(originalFile, originalSource);
+    writeFileSync(entryFile, generatedSource);
+    writeFileSync(
+      join(root, 'runtime.js'),
+      `export const factory = () => (value) => String(value);`
+    );
+    writeFileSync(
+      join(root, 'tokens.js'),
+      `export const space = { medium: 12 };`
+    );
+
+    try {
+      await runStatic(root, entryFile, sourceMap.toJSON() as RawSourceMap);
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).toContain(`${originalFile}:4:1`);
+      expect(message).toContain('/*#__PURE__*/ factory()(space)');
+      expect(message).not.toContain(`${entryFile}:5:1`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('suppresses a hint when a source map cannot prove its editable range', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-fail-'));
+    const entryFile = join(root, 'entry.js');
+    const originalFile = join(root, 'entry.tsx');
+    const generatedSource = [
+      `import { css } from 'test-css-processor';`,
+      `import { factory } from './runtime.js';`,
+      `import { space } from './tokens.js';`,
+      `factory()(space);`,
+      'export const className = css`padding: ${space.medium}px;`;',
+    ].join('\n');
+    const originalSource = generatedSource.replace(
+      'factory()(space);',
+      '<Factory value={space} />;'
+    );
+    const sourceMap = new SourceMapGenerator({ file: entryFile });
+    sourceMap.addMapping({
+      generated: { column: 0, line: 4 },
+      original: { column: 0, line: 4 },
+      source: originalFile,
+    });
+    sourceMap.addMapping({
+      generated: { column: 'factory()(space)'.length, line: 4 },
+      original: { column: '<Factory value={space} />'.length, line: 4 },
+      source: originalFile,
+    });
+    sourceMap.setSourceContent(originalFile, originalSource);
+    writeFileSync(entryFile, generatedSource);
+    writeFileSync(
+      join(root, 'runtime.js'),
+      `export const factory = () => (value) => String(value);`
+    );
+    writeFileSync(
+      join(root, 'tokens.js'),
+      `export const space = { medium: 12 };`
+    );
+
+    try {
+      await runStatic(root, entryFile, sourceMap.toJSON() as RawSourceMap);
+      throw new Error('expected static strategy to fail');
+    } catch (error) {
+      const { message } = error as Error;
+      expect(message).not.toContain('Calls that may be safe to annotate');
+      expect(message).not.toContain('/*#__PURE__*/');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
