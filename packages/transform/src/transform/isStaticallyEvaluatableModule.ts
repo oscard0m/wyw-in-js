@@ -8,6 +8,8 @@ import type {
   VariableDeclarator,
 } from 'oxc-parser';
 
+import { recordPipelineUncachedParse } from '../debug/pipelineTelemetry';
+
 const isNode = (value: unknown): value is Node =>
   !!value &&
   typeof value === 'object' &&
@@ -17,16 +19,25 @@ const isNode = (value: unknown): value is Node =>
 const getNodeType = (node: Pick<Node, 'type'>): string => node.type as string;
 
 const parseOxc = (code: string, filename: string): Program => {
-  const parsed = parseSync(filename, code, {
-    astType:
-      filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js',
-    range: true,
-    sourceType: 'unambiguous',
-  });
+  const astType =
+    filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
+  let parsed: ReturnType<typeof parseSync>;
+  try {
+    parsed = parseSync(filename, code, {
+      astType,
+      range: true,
+      sourceType: 'unambiguous',
+    });
+  } catch (error) {
+    recordPipelineUncachedParse(filename, code, 'unambiguous', astType, true);
+    throw error;
+  }
   const fatalError = parsed.errors.find((error) => error.severity === 'Error');
   if (fatalError) {
+    recordPipelineUncachedParse(filename, code, 'unambiguous', astType, true);
     throw new Error(fatalError.message);
   }
+  recordPipelineUncachedParse(filename, code, 'unambiguous', astType, false);
 
   return parsed.program as Program;
 };

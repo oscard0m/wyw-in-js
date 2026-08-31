@@ -11,6 +11,10 @@ import type {
   PerfFinishEvent,
 } from '../utils/EventEmitter';
 import { EventEmitter, isOnActionStartArgs } from '../utils/EventEmitter';
+import {
+  PIPELINE_TELEMETRY_SCHEMA,
+  registerPipelineTelemetryJSONlReporter,
+} from './pipelineTelemetry';
 
 type Timings = Map<string, Map<string, number>>;
 
@@ -95,6 +99,43 @@ const writeJSONl = (stream: NodeJS.WritableStream, data: unknown) => {
   }
 
   stream.write(`${JSON.stringify(data, replacer)}\n`);
+};
+
+const PIPELINE_TELEMETRY_WRITE_CHUNK_CHARS = 256 * 1024;
+
+const createPipelineTelemetryJSONlWriter = (stream: NodeJS.WritableStream) => {
+  let bufferedChars = 0;
+  let bufferedLines: string[] = [];
+  let closed = false;
+  const flush = (): void => {
+    if (closed) return;
+    if (!stream.writable) {
+      bufferedChars = 0;
+      bufferedLines = [];
+      return;
+    }
+    if (bufferedLines.length === 0) return;
+    stream.write(
+      bufferedLines.length === 1 ? bufferedLines[0] : bufferedLines.join('')
+    );
+    bufferedChars = 0;
+    bufferedLines = [];
+  };
+
+  return {
+    end: (): void => {
+      if (closed) return;
+      flush();
+      closed = true;
+    },
+    flush,
+    write: (line: string): void => {
+      if (closed || !stream.writable) return;
+      bufferedLines.push(line);
+      bufferedChars += line.length;
+      if (bufferedChars >= PIPELINE_TELEMETRY_WRITE_CHUNK_CHARS) flush();
+    },
+  };
 };
 
 const createReportStream = (dir: string, filename: string) => {
@@ -188,6 +229,15 @@ export const createFileReporter = (
   const perfSpanStream = createReportStream(options.dir, 'perf-spans.jsonl');
 
   const evalFilesStream = createReportStream(options.dir, 'eval-files.jsonl');
+
+  const pipelineTelemetryStream = createReportStream(
+    options.dir,
+    'pipeline-telemetry.jsonl'
+  );
+  const pipelineTelemetryWriter = createPipelineTelemetryJSONlWriter(
+    pipelineTelemetryStream
+  );
+  writeJSONl(pipelineTelemetryStream, PIPELINE_TELEMETRY_SCHEMA);
 
   const startedAt = performance.now();
   const timings: Timings = new Map();
@@ -312,10 +362,25 @@ export const createFileReporter = (
   };
 
   const emitter = new EventEmitter(onEvent, onAction, onEntrypointEvent);
+  let unregisterPipelineTelemetry = registerPipelineTelemetryJSONlReporter(
+    emitter,
+    workingDir,
+    (line, status) => {
+      pipelineTelemetryWriter.write(line);
+      if (status === 'error') pipelineTelemetryWriter.flush();
+    }
+  );
+  let done = false;
 
   return {
     emitter,
     onDone: (sourceRoot: string) => {
+      if (done) return;
+      done = true;
+      unregisterPipelineTelemetry();
+      unregisterPipelineTelemetry = () => {};
+      pipelineTelemetryWriter.end();
+
       if (options.print) {
         printTimings(timings, startedAt, sourceRoot);
 
@@ -330,6 +395,7 @@ export const createFileReporter = (
         staticPlanStream,
         perfSpanStream,
         evalFilesStream,
+        pipelineTelemetryStream,
       ].forEach((stream) => {
         if (stream.writable) {
           stream.end();

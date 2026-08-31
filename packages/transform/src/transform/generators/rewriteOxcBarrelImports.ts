@@ -1,14 +1,12 @@
 /* eslint-disable no-continue, @typescript-eslint/no-use-before-define, @typescript-eslint/no-explicit-any, no-param-reassign */
 import path from 'path';
 
-import { parseSync } from 'oxc-parser';
 import type {
   ExportAllDeclaration,
   ExportNamedDeclaration,
   ImportDeclaration,
   ImportSpecifier,
   ModuleExportName,
-  Program,
   Statement,
 } from 'oxc-parser';
 
@@ -28,6 +26,7 @@ import type {
   BarrelResolvedBinding,
   RawBarrelManifest,
 } from '../barrelManifest.types';
+import { parseRewrittenBarrel } from './parse-rewritten-barrel';
 
 const NODE_MODULES_SEGMENT = `${path.sep}node_modules${path.sep}`;
 
@@ -231,21 +230,6 @@ const exportSpecifierCode = (specifier: RewrittenExportSpecifier): string => {
   return imported === exported ? imported : `${imported} as ${exported}`;
 };
 
-function parseProgram(code: string, filename: string): Program {
-  const parsed = parseSync(filename, code, {
-    astType:
-      filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js',
-    range: true,
-    sourceType: 'module',
-  });
-  const fatalError = parsed.errors.find((error) => error.severity === 'Error');
-  if (fatalError) {
-    throw new Error(fatalError.message);
-  }
-
-  return parsed.program as Program;
-}
-
 function createAnalysisEntrypoint(
   services: Services,
   filename: string,
@@ -321,7 +305,7 @@ function collectOptimizedImports(
   filename: string
 ): Map<string, string[]> {
   const imports = new Map<string, string[]>();
-  const program = parseProgram(code, filename);
+  const program = parseRewrittenBarrel(code, filename);
 
   for (const statement of program.body as Statement[]) {
     if (statement.type === 'ImportDeclaration') {
@@ -1312,7 +1296,7 @@ export function* rewriteOptimizedOxcBarrelImports(
 ): Generator<any, RewriteResult, any> {
   const dependencies = buildResolvedDependencyMap(resolvedImports);
   const analysisServices = createAnalysisServices(this.services);
-  const program = parseProgram(code, filename);
+  const program = parseRewrittenBarrel(code, filename);
   const replacements: Replacement[] = [];
   const generatedSources = new Set<string>();
   let optimizedCount = 0;

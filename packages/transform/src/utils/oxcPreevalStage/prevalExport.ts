@@ -1,19 +1,30 @@
 import { parseSync } from 'oxc-parser';
 
+import { recordPipelineUncachedParse } from '../../debug/pipelineTelemetry';
+
 const parseSourceType = (
   code: string,
   filename: string
 ): 'module' | 'script' => {
-  const parsed = parseSync(filename, code, {
-    astType:
-      filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js',
-    range: true,
-    sourceType: 'unambiguous',
-  });
+  const astType =
+    filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
+  let parsed: ReturnType<typeof parseSync>;
+  try {
+    parsed = parseSync(filename, code, {
+      astType,
+      range: true,
+      sourceType: 'unambiguous',
+    });
+  } catch (error) {
+    recordPipelineUncachedParse(filename, code, 'unambiguous', astType, true);
+    throw error;
+  }
   const fatalError = parsed.errors.find((error) => error.severity === 'Error');
   if (fatalError) {
+    recordPipelineUncachedParse(filename, code, 'unambiguous', astType, true);
     throw new Error(fatalError.message);
   }
+  recordPipelineUncachedParse(filename, code, 'unambiguous', astType, false);
 
   return parsed.program.sourceType === 'script' ? 'script' : 'module';
 };
