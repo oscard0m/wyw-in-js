@@ -5,6 +5,7 @@
     "@wyw-in-js/template-tag-syntax": "workspace:*"
   },
   "devDependencies": {
+    "@rspack/core": "^1.7.11",
     "@wyw-in-js/webpack-loader": "workspace:*",
     "picocolors": "^1.0.0",
     "prettier": "^3.2.5",
@@ -12,6 +13,7 @@
   },
   "private": true,
   "scripts": {
-    "test": "node ./scripts/test.mjs"
+    "test": "node ./scripts/test.mjs",
+    "test:rspack": "node ./scripts/test.mjs --rspack"
   }
 }

@@ -25,12 +25,19 @@ import {
 
 import { sharedState } from './WYWinJSDebugPlugin';
 import type { ICache } from './cache';
-import { getCacheInstance, registerCacheProvider } from './cache';
+import {
+  clearCacheProviderRegistry,
+  encodeOutputCssPayload,
+  getCacheInstance,
+  registerCacheProvider,
+  toCacheKey,
+  toWebpackRequestPath,
+} from './cache';
 
 export { WYWinJSDebugPlugin } from './WYWinJSDebugPlugin';
 
-const outputCssLoader = fileURLToPath(
-  new URL('./outputCssLoader.js', import.meta.url)
+const outputCssLoader = toWebpackRequestPath(
+  fileURLToPath(new URL('./outputCssLoader.js', import.meta.url))
 );
 
 const stripQueryAndHash = (request: string) => {
@@ -46,7 +53,9 @@ const stripQueryAndHash = (request: string) => {
 };
 
 const hashText = (text: string): string =>
-  crypto.createHash('sha256').update(text).digest('hex').slice(0, 12);
+  crypto.createHash('sha256').update(text).digest('hex');
+
+const shortHashText = (text: string): string => hashText(text).slice(0, 12);
 
 export type LoaderOptions = {
   cacheProvider?: string | ICache;
@@ -92,6 +101,46 @@ type CompilerLike = Compiler & {
 
 type LoaderContextWithCompiler = {
   _compiler?: CompilerLike;
+};
+
+const hasCompilerHooks = (
+  compiler: CompilerLike | undefined
+): compiler is CompilerLike => {
+  const hooks = compiler?.hooks;
+  return Boolean(
+    hooks &&
+      [hooks.done, hooks.failed, hooks.shutdown, hooks.watchClose].some(
+        (hook) => typeof hook?.tap === 'function'
+      )
+  );
+};
+
+const shouldSerializeOutputCssPayload = (
+  compiler: CompilerLike | undefined
+): boolean => {
+  if (!compiler || typeof compiler.getCache !== 'function') {
+    return true;
+  }
+
+  const webpackCache = compiler.options?.cache;
+  if (
+    webpackCache &&
+    typeof webpackCache === 'object' &&
+    webpackCache.type === 'filesystem'
+  ) {
+    return true;
+  }
+
+  const experiments = compiler.options?.experiments as
+    | { cache?: unknown }
+    | undefined;
+  const rspackCache = experiments?.cache;
+  return Boolean(
+    rspackCache &&
+      typeof rspackCache === 'object' &&
+      'type' in rspackCache &&
+      rspackCache.type === 'persistent'
+  );
 };
 
 type ResolverScope = {
@@ -180,9 +229,10 @@ const createResolverScope = (): ResolverScope => {
   };
 };
 
-const disposeCompilerState = (state: CompilerState) => {
+const disposeCompilerState = (compiler: CompilerLike, state: CompilerState) => {
   state.clearResolvers();
   disposeEvalBroker(state.cache);
+  clearCacheProviderRegistry(compiler);
 };
 
 const getCompilerState = (compiler: CompilerLike): CompilerState => {
@@ -197,7 +247,7 @@ const getCompilerState = (compiler: CompilerLike): CompilerState => {
   const state: CompilerState = {
     ...scope,
     clearResolvers: scope.dispose,
-    dispose: () => disposeCompilerState(state),
+    dispose: () => disposeCompilerState(compiler, state),
     hooksInstalled: false,
   };
 
@@ -312,7 +362,10 @@ const webpack5Loader: Loader = function webpack5LoaderPlugin(
     });
 
   const { resourcePath } = this;
-  const { _compiler: compiler } = this as LoaderContextWithCompiler;
+  const { _compiler: loaderCompiler } = this as LoaderContextWithCompiler;
+  const compiler = hasCompilerHooks(loaderCompiler)
+    ? loaderCompiler
+    : undefined;
   const compilerState = compiler
     ? getCompilerState(compiler)
     : createInvocationScope();
@@ -349,7 +402,7 @@ const webpack5Loader: Loader = function webpack5LoaderPlugin(
     key: asyncResolveKey,
   } = compilerState;
   const nativeResolverAlias = toNativeResolverAlias(
-    compiler?.options?.resolve?.alias
+    loaderCompiler?.options?.resolve?.alias
   );
 
   logger('loader %s', this.resourcePath);
@@ -405,36 +458,76 @@ const webpack5Loader: Loader = function webpack5LoaderPlugin(
               ) ?? []
             );
 
-            const cacheInstance = await getCacheInstance(cacheProvider);
-            const cacheProviderId =
-              cacheProvider && typeof cacheProvider === 'object'
-                ? registerCacheProvider(cacheInstance)
-                : '';
-
-            await cacheInstance.set(this.resourcePath, cssText);
-
-            await cacheInstance.setDependencies?.(
-              this.resourcePath,
-              this.getDependencies()
+            const cacheKey = toCacheKey(this.resourcePath);
+            const cacheInstance = await getCacheInstance(
+              cacheProvider,
+              compiler
             );
+            const currentLoader = this.loaders?.[this.loaderIndex];
+            let cacheProviderToken =
+              cacheProvider &&
+              typeof cacheProvider === 'object' &&
+              compiler &&
+              currentLoader?.ident
+                ? hashText(currentLoader.ident)
+                : undefined;
+            if (
+              cacheProviderToken &&
+              !registerCacheProvider(
+                cacheInstance,
+                cacheProviderToken,
+                compiler
+              )
+            ) {
+              // A reused ident cannot safely select between two provider
+              // objects. Keep the first registration valid and make this
+              // request self-contained instead.
+              cacheProviderToken = undefined;
+            }
+            const dependencies = [...this.getDependencies()].sort();
+
+            await cacheInstance.set(cacheKey, cssText);
+
+            await cacheInstance.setDependencies?.(cacheKey, dependencies);
 
             const wywQuery = [
               `wyw=${encodeURIComponent(extension.replace(/^\./, ''))}`,
             ];
 
             if (this.hot) {
-              wywQuery.push(`v=${encodeURIComponent(hashText(cssText))}`);
+              wywQuery.push(`v=${encodeURIComponent(shortHashText(cssText))}`);
             }
 
-            const resourcePathWithQuery = `${this.resourcePath}?${wywQuery.join(
-              '&'
-            )}`;
+            const resourcePathWithQuery = `${toWebpackRequestPath(
+              this.resourcePath
+            )}?${wywQuery.join('&')}`;
 
-            const request = `${outputFileName}!=!${outputCssLoader}?cacheProvider=${encodeURIComponent(
-              typeof cacheProvider === 'string' ? cacheProvider : ''
-            )}&cacheProviderId=${encodeURIComponent(
-              cacheProviderId
-            )}!${resourcePathWithQuery}`;
+            const outputLoaderQuery = new URLSearchParams();
+            if (typeof cacheProvider === 'string') {
+              outputLoaderQuery.set('cacheProvider', cacheProvider);
+            }
+            if (cacheProviderToken) {
+              outputLoaderQuery.set('cacheProviderToken', cacheProviderToken);
+            }
+            if (
+              shouldSerializeOutputCssPayload(loaderCompiler) ||
+              (cacheProvider &&
+                typeof cacheProvider === 'object' &&
+                !cacheProviderToken)
+            ) {
+              outputLoaderQuery.set(
+                'outputCssPayload',
+                encodeOutputCssPayload({ cssText })
+              );
+            }
+            const outputLoaderOptions = outputLoaderQuery.toString();
+            const outputLoaderRequest = outputLoaderOptions
+              ? `${outputCssLoader}?${outputLoaderOptions}`
+              : outputCssLoader;
+
+            const request = `${toWebpackRequestPath(
+              outputFileName
+            )}!=!${outputLoaderRequest}!${resourcePathWithQuery}`;
             const stringifiedRequest = JSON.stringify(
               this.utils.contextify(this.context || this.rootContext, request)
             );
