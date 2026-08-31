@@ -1,7 +1,7 @@
 import type webpack from 'webpack';
 
 import type { ICache } from './cache';
-import { getCacheInstance } from './cache';
+import { getCacheInstance, toCacheKey } from './cache';
 
 export default async function outputCssLoader(
   this: webpack.LoaderContext<{
@@ -18,9 +18,10 @@ export default async function outputCssLoader(
       cacheProviderId
     );
 
-    const result = await cacheInstance.get(this.resourcePath);
+    const cacheKey = toCacheKey(this.resourcePath);
+    const result = await cacheInstance.get(cacheKey);
     const dependencies =
-      (await cacheInstance.getDependencies?.(this.resourcePath)) ?? [];
+      (await cacheInstance.getDependencies?.(cacheKey)) ?? [];
 
     dependencies.forEach((dependency) => {
       this.addDependency(dependency);

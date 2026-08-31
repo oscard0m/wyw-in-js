@@ -25,13 +25,15 @@ import {
 
 import { sharedState } from './WYWinJSDebugPlugin';
 import type { ICache } from './cache';
-import { getCacheInstance, registerCacheProvider } from './cache';
+import { getCacheInstance, registerCacheProvider, toCacheKey } from './cache';
 
 export { WYWinJSDebugPlugin } from './WYWinJSDebugPlugin';
 
 const outputCssLoader = fileURLToPath(
   new URL('./outputCssLoader.js', import.meta.url)
-);
+).replace(/\\/g, '/');
+
+const toWebpackRequestPath = (filePath: string) => filePath.replace(/\\/g, '/');
 
 const stripQueryAndHash = (request: string) => {
   const queryIdx = request.indexOf('?');
@@ -406,15 +408,13 @@ const webpack5Loader: Loader = function webpack5LoaderPlugin(
             );
 
             const cacheInstance = await getCacheInstance(cacheProvider);
-            const cacheProviderId =
-              cacheProvider && typeof cacheProvider === 'object'
-                ? registerCacheProvider(cacheInstance)
-                : '';
+            const cacheProviderId = registerCacheProvider(cacheInstance);
+            const cacheKey = toCacheKey(this.resourcePath);
 
-            await cacheInstance.set(this.resourcePath, cssText);
+            await cacheInstance.set(cacheKey, cssText);
 
             await cacheInstance.setDependencies?.(
-              this.resourcePath,
+              cacheKey,
               this.getDependencies()
             );
 
@@ -426,11 +426,13 @@ const webpack5Loader: Loader = function webpack5LoaderPlugin(
               wywQuery.push(`v=${encodeURIComponent(hashText(cssText))}`);
             }
 
-            const resourcePathWithQuery = `${this.resourcePath}?${wywQuery.join(
-              '&'
-            )}`;
+            const resourcePathWithQuery = `${toWebpackRequestPath(
+              this.resourcePath
+            )}?${wywQuery.join('&')}`;
 
-            const request = `${outputFileName}!=!${outputCssLoader}?cacheProvider=${encodeURIComponent(
+            const request = `${toWebpackRequestPath(
+              outputFileName
+            )}!=!${outputCssLoader}?cacheProvider=${encodeURIComponent(
               typeof cacheProvider === 'string' ? cacheProvider : ''
             )}&cacheProviderId=${encodeURIComponent(
               cacheProviderId

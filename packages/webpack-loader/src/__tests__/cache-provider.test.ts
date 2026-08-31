@@ -136,4 +136,92 @@ describe('webpack-loader cacheProvider', () => {
       } as any);
     });
   });
+
+  it('emits CSS when outputCssLoader sees a Windows path variant of the source file', async () => {
+    transformMock.mockResolvedValue({
+      code: 'module.exports = 1;',
+      sourceMap: null,
+      cssText: '.title{color:blue}',
+      cssSourceMapText: '',
+      dependencies: [],
+    });
+
+    const { default: webpackLoader } = await import('../index');
+    const { default: outputCssLoader } = await import('../outputCssLoader');
+
+    const writerPath = 'D:\\work\\app\\commonStyle.ts';
+    const readerPath = 'D:/work/app/commonStyle.ts';
+    let emittedRequest = '';
+
+    await new Promise<void>((resolve, reject) => {
+      webpackLoader.call(
+        {
+          addDependency: jest.fn(),
+          async: jest.fn(),
+          callback: (err: Error | null, code?: string) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+
+            const match = String(code).match(/require\(([^)]+)\);/);
+            if (!match) {
+              reject(new Error('Expected loader to emit a require() call'));
+              return;
+            }
+
+            emittedRequest = match[1].trim();
+            resolve();
+          },
+          context: process.cwd(),
+          emitWarning: jest.fn(),
+          getDependencies: () => [],
+          getOptions: () => ({}),
+          getResolve: () =>
+            jest.fn(
+              (
+                _ctx: string,
+                _token: string,
+                cb: (err: any, res: any) => void
+              ) => cb(null, null)
+            ),
+          resourcePath: writerPath,
+          rootContext: process.cwd(),
+          utils: {
+            contextify: (_ctx: string, request: string) => request,
+          },
+        } as any,
+        'module.exports = 1;',
+        null
+      );
+    });
+
+    const request = JSON.parse(emittedRequest);
+    const query = request.split('?', 2)[1].split('!', 1)[0];
+    const params = new URLSearchParams(query);
+
+    expect(request).toContain('D:/work/app/commonStyle.ts');
+    expect(params.get('cacheProviderId')).toBeTruthy();
+
+    await new Promise<void>((resolve, reject) => {
+      outputCssLoader.call({
+        addDependency: jest.fn(),
+        async: jest.fn(),
+        callback: (err: Error | null, css?: string) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+
+          expect(css).toContain('.title{color:blue}');
+          resolve();
+        },
+        getOptions: () => ({
+          cacheProvider: params.get('cacheProvider') || undefined,
+          cacheProviderId: params.get('cacheProviderId') || undefined,
+        }),
+        resourcePath: readerPath,
+      } as any);
+    });
+  });
 });
