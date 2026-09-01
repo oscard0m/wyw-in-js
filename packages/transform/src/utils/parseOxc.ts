@@ -1,12 +1,19 @@
 import { parseSync } from 'oxc-parser';
 import type { Program } from 'oxc-parser';
 
+import {
+  recordPipelineCachedParseMiss,
+  recordPipelineCachedParseHit,
+} from '../debug/pipelineTelemetry';
+
 type OxcSourceType = 'module' | 'unambiguous';
 
 type ParsedOxc = {
+  jsxFallback: boolean;
   module: {
     hasModuleSyntax: boolean;
   };
+  pipelineMeasurement: { bytes: number; revision: string } | undefined;
   program: Program;
 };
 
@@ -53,36 +60,99 @@ export const parseOxcCached = (
   const cacheKey = makeCacheKey(filename, code, sourceType);
   const cached = parseCache.get(cacheKey);
   if (cached) {
+    const knownMeasurement = cached.pipelineMeasurement;
+    const measurement = recordPipelineCachedParseHit(
+      cached,
+      filename,
+      code,
+      sourceType,
+      cached.jsxFallback,
+      knownMeasurement
+    );
+    if (measurement && measurement !== knownMeasurement) {
+      cached.pipelineMeasurement = measurement;
+    }
     return cached;
   }
 
-  let parsed = parseSync(filename, code, {
-    astType: getAstType(filename),
-    range: true,
-    sourceType,
-  });
-  let fatalError = parsed.errors.find((error) => error.severity === 'Error');
-  const jsxFallbackFilename = getJsxFallbackFilename(filename);
-  if (fatalError?.message.includes('JSX') && jsxFallbackFilename) {
-    // Some bundlers pass .js files with JSX to WyW before a later JSX transform.
-    parsed = parseSync(jsxFallbackFilename, code, {
-      astType: getAstType(jsxFallbackFilename),
+  const astType = getAstType(filename);
+  let parsed: ReturnType<typeof parseSync>;
+  try {
+    parsed = parseSync(filename, code, {
+      astType,
       range: true,
       sourceType,
     });
+  } catch (error) {
+    recordPipelineCachedParseMiss(
+      filename,
+      code,
+      sourceType,
+      astType,
+      false,
+      true
+    );
+    throw error;
+  }
+  let fatalError = parsed.errors.find((error) => error.severity === 'Error');
+  const jsxFallbackFilename = getJsxFallbackFilename(filename);
+  let jsxFallback = false;
+  if (fatalError?.message.includes('JSX') && jsxFallbackFilename) {
+    // Some bundlers pass .js files with JSX to WyW before a later JSX transform.
+    jsxFallback = true;
+    try {
+      parsed = parseSync(jsxFallbackFilename, code, {
+        astType: getAstType(jsxFallbackFilename),
+        range: true,
+        sourceType,
+      });
+    } catch (error) {
+      recordPipelineCachedParseMiss(
+        filename,
+        code,
+        sourceType,
+        astType,
+        jsxFallback,
+        true
+      );
+      throw error;
+    }
     fatalError = parsed.errors.find((error) => error.severity === 'Error');
   }
 
   if (fatalError) {
+    recordPipelineCachedParseMiss(
+      filename,
+      code,
+      sourceType,
+      astType,
+      jsxFallback,
+      true
+    );
     throw new Error(fatalError.message);
   }
 
-  return setCachedParse(cacheKey, {
+  const cachedParse = setCachedParse(cacheKey, {
+    jsxFallback,
     module: {
       hasModuleSyntax: parsed.module.hasModuleSyntax,
     },
+    pipelineMeasurement: undefined,
     program: parsed.program as Program,
   });
+  const telemetryMeasurement = recordPipelineCachedParseMiss(
+    filename,
+    code,
+    sourceType,
+    astType,
+    jsxFallback,
+    false,
+    cachedParse
+  );
+  if (telemetryMeasurement) {
+    cachedParse.pipelineMeasurement = telemetryMeasurement;
+  }
+  return cachedParse;
 };
 
 export const parseOxcProgramCached = (

@@ -3,19 +3,14 @@
 import type { Node, Program } from 'oxc-parser';
 
 import { getOxcNodeChildren, isOxcNode } from '../oxc/ast';
-import { applyOxcReplacements } from '../oxc/replacements';
 import {
   collectDeclaredNames,
   collectImportLocalNames,
-  collectReferencedNames,
-  collectRemovableNamesFromStatements,
   collectTopLevelBindings,
-  collectTopLevelBindingsFromStatements,
-  collectTopLevelStatementInfos,
   getImportSpecifierLocalName,
   isNodeReference,
 } from './cleanupBindings';
-import { GENERATED_HELPER_NAME_RE, parseOxc } from './shared';
+import { GENERATED_HELPER_NAME_RE } from './shared';
 import type {
   AnyNode,
   Replacement,
@@ -926,93 +921,4 @@ export const collectEmptyTopLevelBlockRemovals = (
   });
 
   return removals;
-};
-
-export const removeUnusedAfterReplacement = (
-  code: string,
-  filename: string,
-  initialRemovableNames: Set<string>,
-  removableExpressionRefs: Set<string>,
-  preserveSideEffectImportLocals: Set<string>,
-  preserveSideEffectImportOrderLocals: Set<string> = preserveSideEffectImportLocals
-): string => {
-  let current = code;
-  let program: Program | null = null;
-  const cumulativeRemovableNames = new Set(initialRemovableNames);
-
-  // Incremental cleanup loop: validate-by-parsing the next iteration's
-  // candidate code AND reuse that parse as the next iter's `program` input,
-  // instead of re-parsing at the top of the next iter. Saves one parse per
-  // loop revolution (N+1 parses for an N-iter loop instead of 2N).
-  // Also short-circuits a round earlier when no removals were collected.
-  for (let idx = 0; idx < 5; idx += 1) {
-    const previous = current;
-    if (program === null) {
-      program = parseOxc(current, filename);
-    }
-    const statements = collectTopLevelStatementInfos(program);
-    const removableNames = collectRemovableNamesFromStatements(
-      statements,
-      cumulativeRemovableNames
-    );
-    removableNames.forEach((name) => cumulativeRemovableNames.add(name));
-    const referencedNames = collectReferencedNames(program);
-    const topLevelBindings = collectTopLevelBindingsFromStatements(statements);
-    const scopedBindings = collectScopedBindingInfos(program);
-    const removals = mergeEmptyRemovalRanges([
-      ...collectUnusedScopedDeclarationRemovals(
-        current,
-        scopedBindings,
-        cumulativeRemovableNames
-      ),
-      ...collectUnusedTopLevelDeclarationRemovals(
-        current,
-        program,
-        referencedNames,
-        cumulativeRemovableNames
-      ),
-      ...collectUnusedGeneratedHelperDeclarationRemovals(
-        current,
-        program,
-        referencedNames
-      ),
-      ...collectUnusedImportRemovals(
-        current,
-        program,
-        referencedNames,
-        cumulativeRemovableNames,
-        preserveSideEffectImportLocals,
-        preserveSideEffectImportOrderLocals
-      ),
-      ...collectTopLevelExpressionStatementRemovals(
-        current,
-        statements,
-        topLevelBindings,
-        removableExpressionRefs
-      ),
-      ...collectEmptyTopLevelBlockRemovals(current, program),
-    ]);
-
-    if (removals.length === 0) {
-      // Convergence: next iter would parse the same code and see the same
-      // removable set. Skip the round of walks + parse.
-      return current;
-    }
-
-    const next = applyOxcReplacements(current, removals);
-    try {
-      // Validate + capture the AST for the next iteration in one parse.
-      program = parseOxc(next, filename);
-      current = next;
-    } catch {
-      // Pathological removal — drop this iteration and return prior state.
-      return current;
-    }
-
-    if (current === previous) {
-      return current;
-    }
-  }
-
-  return current;
 };

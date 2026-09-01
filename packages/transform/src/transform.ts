@@ -24,6 +24,13 @@ import { withDefaultServices } from './transform/helpers/withDefaultServices';
 import type { Handlers, Services } from './transform/types';
 import { configureEvalSession } from './transform/evalSession';
 import type { Result } from './types';
+import {
+  hasPipelineTelemetryReporter,
+  isPipelineTelemetryActive,
+  markPipelineRootStatus,
+  runWithoutPipelineTelemetry,
+  runWithPipelineTelemetry,
+} from './debug/pipelineTelemetry';
 
 type PartialServices = Partial<Omit<Services, 'options'>> & {
   options: Omit<Services['options'], 'pluginOptions'> & {
@@ -33,22 +40,7 @@ type PartialServices = Partial<Omit<Services, 'options'>> & {
 
 type AllHandlers<TMode extends 'async' | 'sync'> = Handlers<TMode>;
 
-export function transformSync(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _partialServices: PartialServices,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _originalCode: string,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _syncResolve: (what: string, importer: string, stack: string[]) => string,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _customHandlers: Partial<AllHandlers<'sync'>> = {}
-): Result {
-  throw new Error(
-    '[wyw-in-js] transformSync is not supported in v2. Use transform() (async) instead.'
-  );
-}
-
-export async function transform(
+const executeTransform = async (
   partialServices: PartialServices,
   originalCode: string,
   asyncResolve: (
@@ -56,17 +48,18 @@ export async function transform(
     importer: string,
     stack: string[]
   ) => Promise<string | null>,
-  customHandlers: Partial<AllHandlers<'sync'>> = {}
-): Promise<Result> {
-  const { options } = partialServices;
-  const pluginOptions = loadWywOptions(options.pluginOptions);
+  customHandlers: Partial<AllHandlers<'sync'>>
+): Promise<Result> => {
+  const { options: partialOptions } = partialServices;
+  const pluginOptions = loadWywOptions(partialOptions.pluginOptions);
   const services = withDefaultServices({
     ...partialServices,
     options: {
-      ...options,
+      ...partialOptions,
       pluginOptions,
     },
   });
+  const { options } = services;
 
   if (
     !isFeatureEnabled(pluginOptions.features, 'globalCache', options.filename)
@@ -97,6 +90,7 @@ export async function transform(
   );
 
   if (entrypoint.ignored) {
+    markPipelineRootStatus('ignored');
     return {
       code: originalCode,
       sourceMap: options.inputSourceMap,
@@ -130,6 +124,7 @@ export async function transform(
     if (
       isFeatureEnabled(pluginOptions.features, 'softErrors', options.filename)
     ) {
+      markPipelineRootStatus('soft-error');
       // eslint-disable-next-line no-console
       console.error(`Error during transform of ${entrypoint.name}:`, err);
 
@@ -143,4 +138,63 @@ export async function transform(
   } finally {
     disposeActionContext(actionContext);
   }
+};
+
+export function transformSync(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _partialServices: PartialServices,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _originalCode: string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _syncResolve: (what: string, importer: string, stack: string[]) => string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _customHandlers: Partial<AllHandlers<'sync'>> = {}
+): Result {
+  throw new Error(
+    '[wyw-in-js] transformSync is not supported in v2. Use transform() (async) instead.'
+  );
+}
+
+export function transform(
+  partialServices: PartialServices,
+  originalCode: string,
+  asyncResolve: (
+    what: string,
+    importer: string,
+    stack: string[]
+  ) => Promise<string | null>,
+  customHandlers: Partial<AllHandlers<'sync'>> = {}
+): Promise<Result> {
+  const { eventEmitter } = partialServices;
+  if (!eventEmitter || !hasPipelineTelemetryReporter(eventEmitter)) {
+    if (isPipelineTelemetryActive()) {
+      return runWithoutPipelineTelemetry(() =>
+        executeTransform(
+          partialServices,
+          originalCode,
+          asyncResolve,
+          customHandlers
+        )
+      );
+    }
+
+    return executeTransform(
+      partialServices,
+      originalCode,
+      asyncResolve,
+      customHandlers
+    );
+  }
+
+  return runWithPipelineTelemetry(
+    eventEmitter,
+    () => ({ filename: partialServices.options.filename }),
+    () =>
+      executeTransform(
+        partialServices,
+        originalCode,
+        asyncResolve,
+        customHandlers
+      )
+  );
 }

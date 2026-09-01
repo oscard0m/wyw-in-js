@@ -7,6 +7,7 @@ import { parseSync } from 'oxc-parser';
 import type { Debugger, EvalRule, Evaluator } from '@wyw-in-js/shared';
 import { logger } from '@wyw-in-js/shared';
 
+import { recordPipelineUncachedParse } from '../debug/pipelineTelemetry';
 import { oxcShaker } from '../shaker';
 import type { ParentEntrypoint } from '../types';
 import { getFileIdx } from '../utils/getFileIdx';
@@ -51,18 +52,39 @@ export function parseFile(
 ): ParsedAst {
   const log = logger.extend('transform:parse').extend(getFileIdx(filename));
 
-  const parseResult = parseSync(filename, originalCode, {
-    astType:
-      filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js',
-    range: true,
-    sourceType: 'module',
-  });
+  const astType =
+    filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
+  let parseResult: ReturnType<typeof parseSync>;
+  try {
+    parseResult = parseSync(filename, originalCode, {
+      astType,
+      range: true,
+      sourceType: 'module',
+    });
+  } catch (error) {
+    recordPipelineUncachedParse(
+      filename,
+      originalCode,
+      'module',
+      astType,
+      true
+    );
+    throw error;
+  }
   const fatalError = parseResult.errors.find(
     (error) => error.severity === 'Error'
   );
   if (fatalError) {
+    recordPipelineUncachedParse(
+      filename,
+      originalCode,
+      'module',
+      astType,
+      true
+    );
     throw new Error(fatalError.message);
   }
+  recordPipelineUncachedParse(filename, originalCode, 'module', astType, false);
 
   log('stage-1', `${filename} has been parsed`);
 
