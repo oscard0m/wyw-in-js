@@ -1,4 +1,3 @@
-import { parseSync } from 'oxc-parser';
 import type {
   ExportNamedDeclaration,
   ImportDeclaration,
@@ -9,6 +8,7 @@ import type {
 } from 'oxc-parser';
 
 import { recordPipelineUncachedParse } from '../debug/pipelineTelemetry';
+import { parseOxcSync } from '../utils/parseOxc';
 
 const isNode = (value: unknown): value is Node =>
   !!value &&
@@ -21,9 +21,9 @@ const getNodeType = (node: Pick<Node, 'type'>): string => node.type as string;
 const parseOxc = (code: string, filename: string): Program => {
   const astType =
     filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
-  let parsed: ReturnType<typeof parseSync>;
+  let parsed: ReturnType<typeof parseOxcSync>;
   try {
-    parsed = parseSync(filename, code, {
+    parsed = parseOxcSync(filename, code, {
       astType,
       range: true,
       sourceType: 'unambiguous',

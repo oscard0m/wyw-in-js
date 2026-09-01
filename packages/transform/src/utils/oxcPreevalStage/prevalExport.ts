@@ -1,6 +1,5 @@
-import { parseSync } from 'oxc-parser';
-
 import { recordPipelineUncachedParse } from '../../debug/pipelineTelemetry';
+import { parseOxcSync } from '../parseOxc';
 
 const parseSourceType = (
   code: string,
@@ -8,9 +7,9 @@ const parseSourceType = (
 ): 'module' | 'script' => {
   const astType =
     filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
-  let parsed: ReturnType<typeof parseSync>;
+  let parsed: ReturnType<typeof parseOxcSync>;
   try {
-    parsed = parseSync(filename, code, {
+    parsed = parseOxcSync(filename, code, {
       astType,
       range: true,
       sourceType: 'unambiguous',

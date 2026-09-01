@@ -1,9 +1,6 @@
 import { readFileSync } from 'fs';
-import { dirname, extname, isAbsolute } from 'path';
 import { createRequire } from 'module';
-
-import { parseSync } from 'oxc-parser';
-
+import { dirname, extname, isAbsolute } from 'path';
 import type { Debugger, EvalRule, Evaluator } from '@wyw-in-js/shared';
 import { logger } from '@wyw-in-js/shared';
 
@@ -11,6 +8,8 @@ import { recordPipelineUncachedParse } from '../debug/pipelineTelemetry';
 import { oxcShaker } from '../shaker';
 import type { ParentEntrypoint } from '../types';
 import { getFileIdx } from '../utils/getFileIdx';
+import { parseOxcSync } from '../utils/parseOxc';
+import { stripQueryAndHash } from '../utils/parseRequest';
 
 import type {
   IEntrypointCode,
@@ -18,7 +17,6 @@ import type {
   ParsedAst,
 } from './Entrypoint.types';
 import type { Services } from './types';
-import { stripQueryAndHash } from '../utils/parseRequest';
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -54,9 +52,9 @@ export function parseFile(
 
   const astType =
     filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
-  let parseResult: ReturnType<typeof parseSync>;
+  let parseResult: ReturnType<typeof parseOxcSync>;
   try {
-    parseResult = parseSync(filename, originalCode, {
+    parseResult = parseOxcSync(filename, originalCode, {
       astType,
       range: true,
       sourceType: 'module',

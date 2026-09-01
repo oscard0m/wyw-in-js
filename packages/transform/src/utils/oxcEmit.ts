@@ -3,7 +3,6 @@
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-import { parseSync } from 'oxc-parser';
 import type {
   BindingPattern,
   ExportDefaultDeclaration,
@@ -19,6 +18,8 @@ import type {
 } from 'oxc-parser';
 
 import { recordPipelineUncachedParse } from '../debug/pipelineTelemetry';
+
+import { parseOxcSync } from './parseOxc';
 
 type Replacement = {
   end: number;
@@ -246,9 +247,9 @@ const applyReplacements = (
 };
 
 const parseJsModule = (code: string, filename: string): Program => {
-  let parsed: ReturnType<typeof parseSync>;
+  let parsed: ReturnType<typeof parseOxcSync>;
   try {
-    parsed = parseSync(filename, code, {
+    parsed = parseOxcSync(filename, code, {
       astType: 'js',
       range: true,
       sourceType: 'module',
