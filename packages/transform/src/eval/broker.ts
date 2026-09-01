@@ -1120,6 +1120,10 @@ export class EvalBroker {
     Promise<PreparedCacheEntry>
   >();
 
+  // An invalidated id must keep asking the runner to drop its exact module
+  // state until a complete LOAD_RESULT carrying resetModule is written.
+  private readonly pendingModuleResets = new Set<string>();
+
   private readonly importsByModule = new Map<string, Map<string, string[]>>();
 
   private readonly onlyByModule = new Map<string, string[]>();
@@ -1566,6 +1570,7 @@ export class EvalBroker {
     this.lastInitKey = null;
     this.lastHappyDomEnabled = false;
     this.loadMirror.clear();
+    this.pendingModuleResets.clear();
     this.sessionLinkGraph.clear();
     this.stableInitHashCache = null;
     flushDebugStreams();
@@ -1617,6 +1622,7 @@ export class EvalBroker {
       this.lastInitKey = null;
       this.lastHappyDomEnabled = false;
       this.loadMirror.clear();
+      this.pendingModuleResets.clear();
       this.sessionLinkGraph.clear();
     });
   }
@@ -1779,6 +1785,7 @@ export class EvalBroker {
     // New process ⇒ runner's moduleCache/moduleHashes are empty, so our mirror
     // of "what we already shipped" is stale.
     this.loadMirror.clear();
+    this.pendingModuleResets.clear();
     this.sessionLinkGraph.clear();
     this.recordBrokerLifecycle('runner-activated', 'happy-dom-replacement');
   }
@@ -1998,6 +2005,7 @@ export class EvalBroker {
           // context rebuild or reuseModules:false). Drop our shipped-code
           // mirror so handleLoad ships fresh code on the next LOAD.
           this.loadMirror.clear();
+          this.pendingModuleResets.clear();
           this.sessionLinkGraph.clear();
           this.activeEvalTelemetry?.recordRunnerSignal({
             type: 'modules-reset',
@@ -2021,6 +2029,7 @@ export class EvalBroker {
           });
           for (const evictedId of evictedIds) {
             this.loadMirror.delete(evictedId);
+            this.pendingModuleResets.delete(evictedId);
           }
         }
         if (message.error) {
@@ -2814,6 +2823,8 @@ export class EvalBroker {
   ) {
     telemetry?.recordLoadRequest();
     const prepared = await this.loadModule(payload, telemetry);
+    const resetModule =
+      prepared.resetModule === true || this.pendingModuleResets.has(payload.id);
 
     // Decide once whether the runner already has this exact prepared variant.
     // The runner caches by id and short-circuits when the LoadResult hash
@@ -2823,6 +2834,7 @@ export class EvalBroker {
     const previouslySent = prepared.hash
       ? this.loadMirror.get(payload.id)
       : undefined;
+    if (resetModule) this.loadMirror.delete(payload.id);
     // Legacy broker dedup and telemetry use separate shape classifiers because
     // the runner stores `only=[]` as a variant, not as wildcard coverage.
     const sameStorageShape = Boolean(
@@ -2834,7 +2846,8 @@ export class EvalBroker {
         hasSameRunnerStorageShape(previouslySent.only, prepared.only)
     );
     const runnerHasCachedVariant = Boolean(
-      prepared.hash &&
+      !resetModule &&
+        prepared.hash &&
         previouslySent &&
         previouslySent.hash === prepared.hash &&
         sameStorageShape &&
@@ -2856,6 +2869,7 @@ export class EvalBroker {
           hash: prepared.hash,
           hasSerializedExports: Boolean(prepared.exports),
           previouslySent,
+          resetModule,
           sameStorageShape: sameRunnerStorageShape,
           shouldShipCode,
           token: telemetry,
@@ -2901,13 +2915,17 @@ export class EvalBroker {
         hash: prepared.hash,
         only: prepared.only,
         exports: prepared.exports,
+        ...(resetModule ? { resetModule: true } : {}),
       },
       transmissionTelemetry
     );
+    if (resetModule) {
+      this.pendingModuleResets.delete(payload.id);
+    }
 
     if (shouldShipCode && prepared.hash) {
       const merged =
-        previouslySent?.hash === prepared.hash
+        !resetModule && previouslySent?.hash === prepared.hash
           ? mergeOnly(previouslySent.only, prepared.only)
           : [...prepared.only];
       this.loadMirror.set(payload.id, {
@@ -2941,23 +2959,57 @@ export class EvalBroker {
   private async loadModule(
     { id, importerId, request }: LoadRequestPayload,
     telemetry = this.activeEvalTelemetry
-  ): Promise<PreparedCacheEntry> {
+  ): Promise<PreparedCacheEntry & { resetModule?: true }> {
     const actionEntrypoint = importerId ?? id;
     return this.services.eventEmitter.action(
       'eval:loadModule',
       `${actionEntrypoint}\0${id}`,
       actionEntrypoint,
-      () => this.loadModuleImpl({ id, importerId, request }, telemetry)
+      () => {
+        const predecessor = this.loadInFlight.get(id);
+        if (!predecessor) {
+          // Cache and serialized-export hits have no asynchronous critical
+          // section. A real preparation registers itself below before this
+          // call yields, so only successors need the outer strict chain.
+          return this.loadModuleImpl({ id, importerId, request }, telemetry);
+        }
+
+        telemetry?.recordLoadCacheOutcome('inflight-wait');
+        const task = (async () => {
+          try {
+            await predecessor;
+          } catch {
+            // The request that owns the predecessor receives its own error.
+            // A queued request must retry, especially when it follows an
+            // invalidation that may have fixed the failed source.
+          }
+          return this.loadModuleImpl(
+            { id, importerId, request },
+            telemetry,
+            true,
+            false
+          );
+        })();
+        this.loadInFlight.set(id, task);
+        return task.finally(() => {
+          if (this.loadInFlight.get(id) === task) {
+            this.loadInFlight.delete(id);
+          }
+        });
+      }
     );
   }
 
   private async loadModuleImpl(
     { id, importerId, request }: LoadRequestPayload,
-    telemetry = this.activeEvalTelemetry
-  ): Promise<PreparedCacheEntry> {
+    telemetry = this.activeEvalTelemetry,
+    waitedForInflight = false,
+    registerPreparation = true
+  ): Promise<PreparedCacheEntry & { resetModule?: true }> {
     let cached = this.loadCache.get(id);
     const invalidated = this.services.cache.consumeInvalidation(id);
     if (invalidated) {
+      this.pendingModuleResets.add(id);
       if (telemetry && cached) {
         telemetry.recordPreparedCacheEviction({
           id,
@@ -3010,6 +3062,7 @@ export class EvalBroker {
         }
       | undefined;
     if (
+      !this.pendingModuleResets.has(id) &&
       cachedEntrypoint &&
       cachedEntrypoint.evaluated &&
       !cachedEntrypoint.ignored &&
@@ -3053,31 +3106,19 @@ export class EvalBroker {
     // entrypoint when its source is unchanged; my IPC dedup mirror then
     // suppresses re-shipping to the runner.
     if (cached && isPreparedCacheHit(cached, requiredOnly)) {
-      telemetry?.recordLoadCacheOutcome('hit');
+      telemetry?.recordLoadCacheOutcome(
+        waitedForInflight ? 'inflight-hit' : 'hit'
+      );
       this.ensureImportsMapping(id, cached.imports);
       return cached;
     }
 
-    const inflight = this.loadInFlight.get(id);
-    let inflightWaitMiss = false;
-    if (inflight) {
-      telemetry?.recordLoadCacheOutcome('inflight-wait');
-      const result = await inflight;
-      if (isPreparedCacheHit(result, requiredOnly)) {
-        telemetry?.recordLoadCacheOutcome('inflight-hit');
-        this.ensureImportsMapping(id, result.imports);
-        return result;
-      }
-      inflightWaitMiss = true;
+    if (waitedForInflight) {
       telemetry?.recordLoadCacheOutcome('inflight-wait-miss');
     }
 
     telemetry?.recordLoadCacheOutcome(
-      invalidated
-        ? 'invalidation-miss'
-        : cached || inflightWaitMiss
-        ? 'promotion'
-        : 'miss'
+      invalidated ? 'invalidation-miss' : cached ? 'promotion' : 'miss'
     );
 
     const slowImportWarningsEnabled = isWarningEnabled(
@@ -3260,7 +3301,9 @@ export class EvalBroker {
       return { ...prepared, hash };
     })();
 
-    this.loadInFlight.set(id, task);
+    if (registerPreparation) {
+      this.loadInFlight.set(id, task);
+    }
 
     try {
       const result = await task;
@@ -3290,9 +3333,11 @@ export class EvalBroker {
             }
           : undefined
       );
-      return result;
+      return invalidated ? { ...result, resetModule: true } : result;
     } finally {
-      this.loadInFlight.delete(id);
+      if (registerPreparation && this.loadInFlight.get(id) === task) {
+        this.loadInFlight.delete(id);
+      }
     }
   }
 

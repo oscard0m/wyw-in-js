@@ -2109,50 +2109,55 @@ resolveModule = async (specifier, importer, kind) => {
   }
 };
 
-loadModule = async (id, importer, requestSpec) => {
+const loadModuleUnqueued = async (id, importer, requestSpec) => {
   let cached = moduleCache.get(id);
-  const inFlight = loadInFlight.get(id);
-  if (inFlight) {
-    await inFlight;
-    cached = moduleCache.get(id);
+  const loadStart = Date.now();
+  const loaded = await request('LOAD', {
+    id,
+    importerId: importer,
+    request: requestSpec ?? null,
+  });
+  debug('load:done', {
+    id,
+    importer,
+    durationMs: Date.now() - loadStart,
+  });
+  if (loaded.error) {
+    // Surface the importer + specifier alongside the broker's message.
+    // Without this, ENOENT and similar load failures bubble up as a bare
+    // path (or, after Node's VM wraps them, as the opaque
+    // ERR_VM_MODULE_STATUS) leaving no clue which file's import is broken.
+    const detail = [
+      `[wyw-in-js] Failed to load module during evaluation.`,
+      `  importer: ${importer ?? '(unknown)'}`,
+      `  request:  ${requestSpec ?? id}`,
+      `  resolved: ${id}`,
+      `  cause:    ${loaded.error.message}`,
+    ].join('\n');
+    // The importer's SourceTextModule (if it was already created and
+    // cached) compiled this `import` against `id`; reusing it next session
+    // would link against the same id and either re-trigger the failure or
+    // skip linking via the status guard. Drop both so the next session
+    // pulls fresh code for both ends of the broken edge.
+    if (importer && importer !== id) {
+      evictPoisonedModule(toSourceModuleId(importer));
+    }
+    evictPoisonedModule(id);
+    const enhanced = new Error(detail);
+    enhanced.cause = reviveSerializedError(loaded.error);
+    throw enhanced;
   }
 
-  const task = (async () => {
-    const loadStart = Date.now();
-    const loaded = await request('LOAD', {
-      id,
-      importerId: importer,
-      request: requestSpec ?? null,
-    });
-    debug('load:done', {
-      id,
-      importer,
-      durationMs: Date.now() - loadStart,
-    });
-    if (loaded.error) {
-      // Surface the importer + specifier alongside the broker's message.
-      // Without this, ENOENT and similar load failures bubble up as a bare
-      // path (or, after Node's VM wraps them, as the opaque
-      // ERR_VM_MODULE_STATUS) leaving no clue which file's import is broken.
-      const detail = [
-        `[wyw-in-js] Failed to load module during evaluation.`,
-        `  importer: ${importer ?? '(unknown)'}`,
-        `  request:  ${requestSpec ?? id}`,
-        `  resolved: ${id}`,
-        `  cause:    ${loaded.error.message}`,
-      ].join('\n');
-      // The importer's SourceTextModule (if it was already created and
-      // cached) compiled this `import` against `id`; reusing it next session
-      // would link against the same id and either re-trigger the failure or
-      // skip linking via the status guard. Drop both so the next session
-      // pulls fresh code for both ends of the broken edge.
-      if (importer && importer !== id) {
-        evictPoisonedModule(toSourceModuleId(importer));
+  cached = moduleCache.get(id);
+  try {
+    if (loaded.resetModule === true) {
+      resetSingleModuleState(id);
+      moduleOnly.delete(id);
+      cached = undefined;
+
+      if (id === state.entrypoint) {
+        resolveCache.clear();
       }
-      evictPoisonedModule(id);
-      const enhanced = new Error(detail);
-      enhanced.cause = reviveSerializedError(loaded.error);
-      throw enhanced;
     }
 
     if (loaded.only) {
@@ -2214,8 +2219,9 @@ loadModule = async (id, importer, requestSpec) => {
 
     const usePrimaryCache = isFullModuleLoad(loaded);
     if (usePrimaryCache) {
-      if (cached && loaded.hash && moduleHashes.get(id) === loaded.hash) {
-        return cached;
+      const current = moduleCache.get(id);
+      if (current && loaded.hash && moduleHashes.get(id) === loaded.hash) {
+        return current;
       }
     } else if (loaded.hash) {
       const variant = getModuleVariant(id, loaded.hash);
@@ -2280,13 +2286,30 @@ loadModule = async (id, importer, requestSpec) => {
       setModuleVariant(id, loaded.hash, module);
     }
     return module;
-  })();
+  } catch (error) {
+    if (importer && importer !== id) {
+      evictPoisonedModule(toSourceModuleId(importer));
+    }
+    evictPoisonedModule(id);
+    throw error;
+  }
+};
 
+loadModule = async (id, importer, requestSpec) => {
+  const predecessor = loadInFlight.get(id);
+  const task = predecessor
+    ? (async () => {
+        await predecessor;
+        return loadModuleUnqueued(id, importer, requestSpec);
+      })()
+    : loadModuleUnqueued(id, importer, requestSpec);
   loadInFlight.set(id, task);
   try {
     return await task;
   } finally {
-    loadInFlight.delete(id);
+    if (loadInFlight.get(id) === task) {
+      loadInFlight.delete(id);
+    }
   }
 };
 

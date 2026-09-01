@@ -322,7 +322,7 @@ describe('createFileReporter', () => {
         expect.objectContaining({
           denominators: expect.any(Object),
           limitations: expect.any(Object),
-          schemaVersion: 1,
+          schemaVersion: 2,
           type: 'eval-telemetry-schema',
         })
       );

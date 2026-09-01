@@ -76,6 +76,7 @@ export type LoadResultPayload = {
   hash?: string;
   only?: string[];
   exports?: Record<string, SerializedValue>;
+  resetModule?: true;
   error?: SerializedError;
 };
 

@@ -344,6 +344,91 @@ describe('EvalBroker telemetry', () => {
     }
   });
 
+  it('counts an invalidated result inserted by an older in-flight load', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-telemetry-'));
+    const entry = join(root, 'entry.js');
+    const dependency = join(root, 'dependency.js');
+    writeFileSync(entry, 'export const __wywPreval = {};');
+
+    let resolveOld: ((value: { code: string }) => void) | undefined;
+    const customLoader = jest
+      .fn<() => Promise<{ code: string }>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          })
+      )
+      .mockResolvedValueOnce({ code: 'export const value = "fresh";' });
+    const emitter = createEmitter();
+    const services = createServices(root, entry, emitter, {
+      eval: { customLoader },
+    });
+    const records: EvalTelemetryRecord[] = [];
+    const unregister = registerEvalTelemetryReporter(emitter, (record) => {
+      records.push(record);
+    });
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dependency)
+    );
+    const privateBroker = broker as unknown as {
+      activeEvalTelemetry: EvalTelemetryToken | undefined;
+      loadModule: (payload: {
+        id: string;
+        importerId: string | null;
+        request: string | null;
+      }) => Promise<{ code: string; resetModule?: true }>;
+      onlyByModule: Map<string, string[]>;
+    };
+    const token = beginEvalTelemetry(emitter, broker, () => ({
+      entrypoint: entry,
+    }));
+    expect(token).toBeDefined();
+    token!.start({ batchIndex: 0, batchSize: 1 });
+    privateBroker.activeEvalTelemetry = token;
+    privateBroker.onlyByModule.set(dependency, ['*']);
+    const payload = {
+      id: dependency,
+      importerId: entry,
+      request: './dependency.js',
+    };
+
+    try {
+      token!.recordLoadRequest();
+      const oldLoad = privateBroker.loadModule(payload);
+      services.cache.invalidateForFile(dependency);
+      token!.recordLoadRequest();
+      const invalidatedLoad = privateBroker.loadModule(payload);
+      resolveOld?.({ code: 'export const value = "old";' });
+
+      const [oldResult, freshResult] = await Promise.all([
+        oldLoad,
+        invalidatedLoad,
+      ]);
+      expect(oldResult.code).toContain('"old"');
+      expect(freshResult.code).toContain('"fresh"');
+      expect(freshResult.resetModule).toBe(true);
+      token!.finish('success');
+
+      const roots = records.filter((record) => record.type === 'eval-root');
+      expect(roots).toHaveLength(1);
+      expect(roots[0].evictions.hostPreparedCache).toEqual(
+        expect.objectContaining({
+          invalidation: 1,
+          total: 1,
+          unknownByteEntries: 0,
+        })
+      );
+      expect(customLoader).toHaveBeenCalledTimes(2);
+    } finally {
+      privateBroker.activeEvalTelemetry = undefined;
+      unregister();
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('records capacity eviction through the broker load cache wiring', async () => {
     const root = mkdtempSync(join(tmpdir(), 'wyw-eval-telemetry-'));
     const entry = join(root, 'entry.js');
@@ -669,7 +754,13 @@ describe('EvalBroker telemetry', () => {
       const code2 = 'export const value = 2;';
       const code3 = 'export const value = 3;';
       const prepared = [
-        { code: code1, hash: 'hash-1', imports: null, only: ['*'] },
+        {
+          code: code1,
+          hash: 'hash-1',
+          imports: null,
+          only: ['*'],
+          resetModule: true as const,
+        },
         { code: code1, hash: 'hash-1', imports: null, only: ['*'] },
         { code: code2, hash: 'hash-2', imports: null, only: ['*'] },
         { code: code3, hash: 'hash-3', imports: null, only: ['value'] },
@@ -680,6 +771,13 @@ describe('EvalBroker telemetry', () => {
           only: ['value', 'other'],
         },
         { code: code3, hash: 'hash-3', imports: null, only: ['*'] },
+        {
+          code: code3,
+          hash: 'hash-3',
+          imports: null,
+          only: ['*'],
+          resetModule: true as const,
+        },
         { code: '', hash: 'hash-4', imports: null, only: ['*'] },
         { code: '', hash: 'hash-5', imports: null, only: [] },
       ];
@@ -691,7 +789,7 @@ describe('EvalBroker telemetry', () => {
       privateBroker.activeEvalTelemetry = token;
 
       try {
-        for (let index = 0; index < 8; index += 1) {
+        for (let index = 0; index < 9; index += 1) {
           // The mirror state under test is intentionally sequential.
           // eslint-disable-next-line no-await-in-loop
           await privateBroker.handleLoad(`load-${index}`, {
@@ -715,18 +813,25 @@ describe('EvalBroker telemetry', () => {
     expect(withTelemetry.trace).toEqual(withoutTelemetry.trace);
 
     const wire = withTelemetry.trace.map((line) => JSON.parse(line));
-    expect(wire).toHaveLength(8);
+    expect(wire).toHaveLength(9);
     expect(wire[0].payload.code).toBe(withTelemetry.code1);
+    expect(wire[0].payload.resetModule).toBe(true);
     expect(wire[1].payload).not.toHaveProperty('code');
-    expect(wire[6].payload).toHaveProperty('code', '');
+    expect(wire[6].payload).toEqual(
+      expect.objectContaining({
+        code: withTelemetry.code3,
+        resetModule: true,
+      })
+    );
     expect(wire[7].payload).toHaveProperty('code', '');
+    expect(wire[8].payload).toHaveProperty('code', '');
 
     const roots = withTelemetry.records.filter(
       (record) => record.type === 'eval-root'
     );
     expect(roots).toHaveLength(1);
     const [record] = roots;
-    expect(record.loads.requests).toBe(8);
+    expect(record.loads.requests).toBe(9);
     expect(record.loads.transmission).toEqual(
       expect.objectContaining({
         chunkedResults: 0,
@@ -734,19 +839,21 @@ describe('EvalBroker telemetry', () => {
         codeBytes:
           Buffer.byteLength(withTelemetry.code1) +
           Buffer.byteLength(withTelemetry.code2) +
-          Buffer.byteLength(withTelemetry.code3) * 3,
+          Buffer.byteLength(withTelemetry.code3) * 4,
         emptyCodePayloads: 2,
         initial: 1,
-        logicalResults: 8,
+        logicalResults: 9,
+        moduleResetSignals: 2,
         omissions: 1,
         resendReasons: {
           'hash-change': 4,
+          invalidation: 1,
           'only-widening': 1,
           'storage-shape-change': 1,
         },
-        resends: 6,
+        resends: 7,
         serializedExports: 0,
-        wireMessages: 8,
+        wireMessages: 9,
       })
     );
     expect(record.loads.transmission.wireBytes).toBe(
@@ -1352,7 +1459,14 @@ describe('EvalBroker telemetry', () => {
     try {
       await privateBroker.sendLoadResult(
         'load-chunked',
-        { code, hash: 'chunked-hash', id: entry, map: null, only: ['*'] },
+        {
+          code,
+          hash: 'chunked-hash',
+          id: entry,
+          map: null,
+          only: ['*'],
+          resetModule: true,
+        },
         {
           details: {
             code,
@@ -1371,9 +1485,11 @@ describe('EvalBroker telemetry', () => {
           chunkIndex: 0,
           hash: 'chunked-hash',
           only: ['*'],
+          resetModule: true,
         })
       );
       expect(wire[1].payload).not.toHaveProperty('hash');
+      expect(wire[1].payload).not.toHaveProperty('resetModule');
       const roots = records.filter((record) => record.type === 'eval-root');
       expect(roots).toHaveLength(1);
       expect(roots[0].loads.transmission).toEqual(
@@ -1383,6 +1499,7 @@ describe('EvalBroker telemetry', () => {
           codeBytes: Buffer.byteLength(code),
           initial: 1,
           logicalResults: 1,
+          moduleResetSignals: 1,
           wireBytes: trace.reduce(
             (total, line) => total + Buffer.byteLength(line),
             0
@@ -1414,6 +1531,7 @@ describe('EvalBroker telemetry', () => {
             id: entry,
             map: null,
             only: ['*'],
+            resetModule: true,
           },
           {
             details: { code, mode: 'initial' },
@@ -1433,6 +1551,7 @@ describe('EvalBroker telemetry', () => {
           codeBytes: 512 * 1024,
           incompleteResults: 1,
           logicalResults: 0,
+          moduleResetSignals: 0,
           wireBytes: Buffer.byteLength(partialTrace[0]),
           wireMessages: 1,
         })

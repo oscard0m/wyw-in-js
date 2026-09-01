@@ -76,6 +76,7 @@ const getPrivateBroker = (broker: EvalBroker) =>
     importsByModule: Map<string, Map<string, string[]>>;
     lastHappyDomEnabled: boolean;
     lastInitKey: string | null;
+    loadMirror: { get: (id: string) => { only: string[] } | undefined };
     onlyByModule: Map<string, string[]>;
     sessionLinkGraph: Set<string>;
     ensureImportsMapping: (
@@ -95,8 +96,11 @@ const getPrivateBroker = (broker: EvalBroker) =>
       request?: string | null;
     }) => Promise<{
       code: string;
+      hash?: string;
       imports: Map<string, string[]> | null;
       only: string[];
+      exports?: Record<string, ReturnType<typeof serializeValue>>;
+      resetModule?: true;
     }>;
     request: (
       type: 'INIT' | 'EVAL',
@@ -940,6 +944,569 @@ describe('EvalBroker', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  it('reships same-hash code only after explicit invalidation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    const customLoader = jest.fn(async () => ({
+      code: 'export const value = 1;',
+    }));
+    const services = createServices(root, importer, {
+      eval: { customLoader },
+    });
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dep)
+    );
+    const privateBroker = getPrivateBroker(broker);
+    const transportBroker = broker as unknown as {
+      handleLoad: (
+        id: string,
+        payload: { id: string; importerId: string; request: string }
+      ) => Promise<void>;
+      runnerInputQueue: { write: (payload: string) => Promise<void> };
+    };
+    const messages: Array<{
+      payload: { code?: string; resetModule?: true };
+    }> = [];
+    transportBroker.runnerInputQueue = {
+      write: async (payload) => {
+        messages.push(JSON.parse(payload));
+      },
+    };
+    privateBroker.onlyByModule.set(dep, ['*']);
+    const request = { id: dep, importerId: importer, request: './dep.js' };
+
+    try {
+      await transportBroker.handleLoad('initial', request);
+      await transportBroker.handleLoad('warm-before', request);
+      services.cache.invalidateForFile(dep);
+      await transportBroker.handleLoad('invalidated', request);
+      await transportBroker.handleLoad('warm-after', request);
+
+      expect(customLoader).toHaveBeenCalledTimes(2);
+      expect(messages).toHaveLength(4);
+      expect(messages[0].payload).toEqual(
+        expect.objectContaining({ code: 'export const value = 1;' })
+      );
+      expect(messages[0].payload).not.toHaveProperty('resetModule');
+      expect(messages[1].payload).not.toHaveProperty('code');
+      expect(messages[1].payload).not.toHaveProperty('resetModule');
+      expect(messages[2].payload).toEqual(
+        expect.objectContaining({
+          code: 'export const value = 1;',
+          resetModule: true,
+        })
+      );
+      expect(messages[3].payload).not.toHaveProperty('code');
+      expect(messages[3].payload).not.toHaveProperty('resetModule');
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('forgets pre-invalidation mirror coverage before tracking a reset module', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    const broker = new EvalBroker(
+      createServices(root, importer),
+      jest.fn(async () => dep)
+    );
+    const transportBroker = broker as unknown as {
+      handleLoad: (
+        id: string,
+        payload: { id: string; importerId: string; request: string }
+      ) => Promise<void>;
+      loadModule: jest.Mock;
+      runnerInputQueue: { write: (payload: string) => Promise<void> };
+    };
+    const code = 'export const value = 1;';
+    const prepared = [
+      { code, hash: 'stable-hash', imports: null, only: ['*'] },
+      {
+        code,
+        hash: 'stable-hash',
+        imports: null,
+        only: ['value'],
+        resetModule: true as const,
+      },
+      { code, hash: 'stable-hash', imports: null, only: ['*'] },
+    ];
+    const messages: Array<{ payload: { code?: string; resetModule?: true } }> =
+      [];
+    transportBroker.loadModule = jest.fn(async () => prepared.shift()!);
+    transportBroker.runnerInputQueue = {
+      write: async (payload) => {
+        messages.push(JSON.parse(payload));
+      },
+    };
+    const request = { id: dep, importerId: importer, request: './dep.js' };
+
+    try {
+      await transportBroker.handleLoad('initial', request);
+      await transportBroker.handleLoad('invalidated', request);
+      await transportBroker.handleLoad('widened-after-reset', request);
+
+      expect(messages).toHaveLength(3);
+      expect(messages[0].payload.code).toBe(code);
+      expect(messages[1].payload).toEqual(
+        expect.objectContaining({ code, resetModule: true })
+      );
+      expect(messages[2].payload.code).toBe(code);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('bypasses stale serialized exports after invalidation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    const customLoader = jest.fn(async () => ({
+      code: 'export const value = "fresh";',
+    }));
+    const services = createServices(root, importer, {
+      eval: { customLoader },
+    });
+    const seedStaleEvaluatedExports = () => {
+      services.cache.add('exports', dep, ['value']);
+      services.cache.add('entrypoints', dep, {
+        evaluated: true,
+        evaluatedOnly: ['value'],
+        exports: { value: 'stale' },
+        ignored: false,
+      } as never);
+    };
+    seedStaleEvaluatedExports();
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dep)
+    );
+    const privateBroker = getPrivateBroker(broker);
+    privateBroker.onlyByModule.set(dep, ['value']);
+    const request = { id: dep, importerId: null, request: null };
+
+    try {
+      const serialized = await privateBroker.loadModule(request);
+      expect(serialized.exports).toEqual(
+        expect.objectContaining({ value: expect.any(Object) })
+      );
+      expect(customLoader).not.toHaveBeenCalled();
+
+      services.cache.invalidateForFile(dep);
+      seedStaleEvaluatedExports();
+
+      const invalidated = await privateBroker.loadModule(request);
+      expect(invalidated.code).toContain('"fresh"');
+      expect(invalidated).not.toHaveProperty('exports');
+      expect(invalidated.resetModule).toBe(true);
+      expect(customLoader).toHaveBeenCalledTimes(1);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps stale serialized exports blocked while a reset retry is pending', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    const customLoader = jest
+      .fn<() => Promise<{ code: string }>>()
+      .mockRejectedValueOnce(new Error('fresh-load-failed'))
+      .mockResolvedValueOnce({ code: 'export const value = "fresh";' });
+    const services = createServices(root, importer, {
+      eval: { customLoader },
+    });
+    const seedStaleEvaluatedExports = () => {
+      services.cache.add('exports', dep, ['value']);
+      services.cache.add('entrypoints', dep, {
+        evaluated: true,
+        evaluatedOnly: ['value'],
+        exports: { value: 'stale' },
+        ignored: false,
+      } as never);
+    };
+    seedStaleEvaluatedExports();
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dep)
+    );
+    const privateBroker = getPrivateBroker(broker);
+    privateBroker.onlyByModule.set(dep, ['value']);
+    const request = { id: dep, importerId: null, request: null };
+
+    try {
+      const serialized = await privateBroker.loadModule(request);
+      expect(serialized).toHaveProperty('exports');
+      services.cache.invalidateForFile(dep);
+      seedStaleEvaluatedExports();
+
+      await expect(privateBroker.loadModule(request)).rejects.toThrow(
+        'fresh-load-failed'
+      );
+      const retried = await privateBroker.loadModule(request);
+      expect(retried.code).toContain('"fresh"');
+      expect(retried).not.toHaveProperty('exports');
+      expect(customLoader).toHaveBeenCalledTimes(2);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reuse an older in-flight preparation after invalidation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    let resolveOld: ((value: { code: string }) => void) | undefined;
+    let resolveFresh: ((value: { code: string }) => void) | undefined;
+    let signalFreshStarted: (() => void) | undefined;
+    const freshStarted = new Promise<void>((resolveFn) => {
+      signalFreshStarted = resolveFn;
+    });
+    const customLoader = jest
+      .fn<() => Promise<{ code: string }>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolveFn) => {
+            resolveOld = resolveFn;
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolveFn) => {
+            resolveFresh = resolveFn;
+            signalFreshStarted?.();
+          })
+      );
+    const services = createServices(root, importer, {
+      eval: { customLoader },
+    });
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dep)
+    );
+    const privateBroker = getPrivateBroker(broker);
+    privateBroker.onlyByModule.set(dep, ['*']);
+    const request = { id: dep, importerId: importer, request: './dep.js' };
+
+    try {
+      const oldLoad = privateBroker.loadModule(request);
+      services.cache.invalidateForFile(dep);
+      const invalidatedLoad = privateBroker.loadModule(request);
+      const concurrentFreshLoad = privateBroker.loadModule(request);
+
+      expect(customLoader).toHaveBeenCalledTimes(1);
+      resolveOld?.({ code: 'export const value = "old";' });
+      await freshStarted;
+      expect(customLoader).toHaveBeenCalledTimes(2);
+
+      resolveFresh?.({ code: 'export const value = "fresh";' });
+
+      const [oldResult, invalidatedResult, concurrentResult] =
+        await Promise.all([oldLoad, invalidatedLoad, concurrentFreshLoad]);
+      expect(oldResult.code).toContain('"old"');
+      expect(oldResult).not.toHaveProperty('resetModule');
+      expect(invalidatedResult.code).toContain('"fresh"');
+      expect(invalidatedResult.resetModule).toBe(true);
+      expect(concurrentResult.code).toContain('"fresh"');
+
+      const warm = await privateBroker.loadModule(request);
+      expect(warm.code).toContain('"fresh"');
+      expect(warm).not.toHaveProperty('resetModule');
+      expect(customLoader).toHaveBeenCalledTimes(2);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('orders repeated invalidations behind the preparation they supersede', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    let resolveOld: ((value: { code: string }) => void) | undefined;
+    let resolveFirstFresh: ((value: { code: string }) => void) | undefined;
+    let resolveSecondFresh: ((value: { code: string }) => void) | undefined;
+    let signalFirstFresh: (() => void) | undefined;
+    let signalSecondFresh: (() => void) | undefined;
+    const firstFreshStarted = new Promise<void>((resolveStarted) => {
+      signalFirstFresh = resolveStarted;
+    });
+    const secondFreshStarted = new Promise<void>((resolveStarted) => {
+      signalSecondFresh = resolveStarted;
+    });
+    const customLoader = jest
+      .fn<() => Promise<{ code: string }>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolveLoad) => {
+            resolveOld = resolveLoad;
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolveLoad) => {
+            resolveFirstFresh = resolveLoad;
+            signalFirstFresh?.();
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolveLoad) => {
+            resolveSecondFresh = resolveLoad;
+            signalSecondFresh?.();
+          })
+      );
+    const services = createServices(root, importer, {
+      eval: { customLoader },
+    });
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dep)
+    );
+    const privateBroker = getPrivateBroker(broker);
+    privateBroker.onlyByModule.set(dep, ['*']);
+    const request = { id: dep, importerId: importer, request: './dep.js' };
+
+    try {
+      const oldLoad = privateBroker.loadModule(request);
+      services.cache.invalidateForFile(dep);
+      const firstFreshLoad = privateBroker.loadModule(request);
+      resolveOld?.({ code: 'export const value = "old";' });
+      await firstFreshStarted;
+
+      services.cache.invalidateForFile(dep);
+      const secondFreshLoad = privateBroker.loadModule(request);
+      const secondFreshWaiter = privateBroker.loadModule(request);
+      resolveFirstFresh?.({ code: 'export const value = "fresh-1";' });
+      await secondFreshStarted;
+      resolveSecondFresh?.({ code: 'export const value = "fresh-2";' });
+
+      const [old, firstFresh, secondFresh, waiter] = await Promise.all([
+        oldLoad,
+        firstFreshLoad,
+        secondFreshLoad,
+        secondFreshWaiter,
+      ]);
+      expect(old.code).toContain('"old"');
+      expect(firstFresh.code).toContain('"fresh-1"');
+      expect(firstFresh.resetModule).toBe(true);
+      expect(secondFresh.code).toContain('"fresh-2"');
+      expect(secondFresh.resetModule).toBe(true);
+      expect(waiter.code).toContain('"fresh-2"');
+      expect(waiter).not.toHaveProperty('resetModule');
+      expect(customLoader).toHaveBeenCalledTimes(3);
+
+      const warm = await privateBroker.loadModule(request);
+      expect(warm.code).toContain('"fresh-2"');
+      expect(customLoader).toHaveBeenCalledTimes(3);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retries after an older in-flight preparation rejects across invalidation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const importer = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    let rejectOld: ((error: Error) => void) | undefined;
+    const customLoader = jest
+      .fn<() => Promise<{ code: string }>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectOld = reject;
+          })
+      )
+      .mockResolvedValueOnce({ code: 'export const value = "fresh";' });
+    const services = createServices(root, importer, {
+      eval: { customLoader },
+    });
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => dep)
+    );
+    const privateBroker = getPrivateBroker(broker);
+    privateBroker.onlyByModule.set(dep, ['*']);
+    const request = { id: dep, importerId: importer, request: './dep.js' };
+
+    try {
+      const oldLoad = privateBroker.loadModule(request);
+      const oldFailure = oldLoad.then(
+        () => new Error('old load unexpectedly succeeded'),
+        (error: unknown) => error
+      );
+      services.cache.invalidateForFile(dep);
+      const invalidatedLoad = privateBroker.loadModule(request);
+      expect(rejectOld).toBeDefined();
+      rejectOld?.(new Error('old-load-failed'));
+
+      const oldError = await oldFailure;
+      expect(oldError).toBeInstanceOf(Error);
+      expect((oldError as Error).message).toBe('old-load-failed');
+      const fresh = await invalidatedLoad;
+      expect(fresh.code).toContain('"fresh"');
+      expect(fresh.resetModule).toBe(true);
+      expect(customLoader).toHaveBeenCalledTimes(2);
+
+      const warm = await privateBroker.loadModule(request);
+      expect(warm.code).toContain('"fresh"');
+      expect(warm).not.toHaveProperty('resetModule');
+      expect(customLoader).toHaveBeenCalledTimes(2);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the broker mirror synchronized when reset code fails to parse', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    const entryCode = [
+      "import { value } from './dep.js';",
+      'export const __wywPreval = { value: () => value };',
+    ].join('\n');
+    writeFileSync(entry, entryCode);
+    writeFileSync(dep, 'export const value = 0;');
+    let dependencyCode = 'export const value = 1;';
+    const customLoader = jest.fn(async (id: string) =>
+      id === dep ? { code: dependencyCode } : null
+    );
+    const services = createServices(root, entry, {
+      eval: { customLoader },
+    });
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async (what: string, importer: string) =>
+        what.startsWith('.') ? resolve(dirname(importer), what) : null
+      )
+    );
+    const evaluate = () =>
+      broker.evaluate(
+        Entrypoint.createRoot(services, entry, ['__wywPreval'], entryCode)
+      );
+    const captureError = async () => {
+      try {
+        await evaluate();
+        throw new Error('expected evaluation to fail');
+      } catch (error) {
+        return error instanceof Error
+          ? error.stack ?? error.message
+          : `${error}`;
+      }
+    };
+
+    try {
+      const initial = await evaluate();
+      expect(initial.values?.get('value')).toBe(1);
+
+      dependencyCode = 'export const value = ;';
+      services.cache.invalidateForFile(dep);
+      services.cache.invalidateForFile(entry);
+      const firstError = await captureError();
+      const repeatedError = await captureError();
+
+      expect(firstError).toMatch(/SyntaxError|Unexpected token/);
+      expect(repeatedError).toMatch(/SyntaxError|Unexpected token/);
+      expect(repeatedError).not.toContain('cache desync');
+
+      dependencyCode = 'export const value = 2;';
+      services.cache.invalidateForFile(dep);
+      services.cache.invalidateForFile(entry);
+      const recovered = await evaluate();
+      expect(recovered.values?.get('value')).toBe(2);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes runner loads when several sibling importers request one id', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const shared = join(root, 'shared.js');
+    writeFileSync(shared, 'export const value = 10;');
+    for (const [name, offset] of [
+      ['a', 1],
+      ['b', 2],
+      ['c', 3],
+    ] as const) {
+      writeFileSync(
+        join(root, `${name}.js`),
+        [
+          "import { value } from './shared.js';",
+          `export const ${name} = value + ${offset};`,
+        ].join('\n')
+      );
+    }
+    const entryCode = [
+      "import { a } from './a.js';",
+      "import { b } from './b.js';",
+      "import { c } from './c.js';",
+      'export const __wywPreval = { total: () => a + b + c };',
+    ].join('\n');
+    writeFileSync(entry, entryCode);
+    const services = createServices(root, entry);
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async (what: string, importer: string) =>
+        what.startsWith('.') ? resolve(dirname(importer), what) : null
+      )
+    );
+    const privateBroker = broker as unknown as {
+      handleLoad: (
+        requestId: string,
+        payload: {
+          id: string;
+          importerId: string | null;
+          request: string | null;
+        }
+      ) => Promise<void>;
+    };
+    const originalHandleLoad = privateBroker.handleLoad.bind(broker);
+    let activeSharedLoads = 0;
+    let concurrentSharedLoad = false;
+    let sharedLoadCalls = 0;
+    privateBroker.handleLoad = async (requestId, payload) => {
+      if (payload.id !== shared) {
+        return originalHandleLoad(requestId, payload);
+      }
+
+      sharedLoadCalls += 1;
+      activeSharedLoads += 1;
+      concurrentSharedLoad ||= activeSharedLoads > 1;
+      try {
+        if (sharedLoadCalls === 2) {
+          await new Promise<void>((resolveDelay) => {
+            setTimeout(resolveDelay, 25);
+          });
+        }
+        return await originalHandleLoad(requestId, payload);
+      } finally {
+        activeSharedLoads -= 1;
+      }
+    };
+
+    try {
+      const result = await broker.evaluate(
+        Entrypoint.createRoot(services, entry, ['__wywPreval'], entryCode)
+      );
+      expect(result.values?.get('total')).toBe(36);
+      expect(sharedLoadCalls).toBeGreaterThanOrEqual(3);
+      expect(concurrentSharedLoad).toBe(false);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('rebuilds processor modules when __wywPreval is requested after named export loads', async () => {
     const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
     const entry = join(root, 'styles.ts');
@@ -1431,6 +1998,55 @@ describe('EvalBroker', () => {
 
     broker.dispose();
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it('recreates invalidated primary runner modules', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const dep = join(root, 'dep.js');
+    const entryCode = [
+      "import * as token from './dep.js';",
+      'export const __wywPreval = {',
+      '  value: () => token.value,',
+      '};',
+    ].join('\n');
+
+    writeFileSync(dep, "export const value = (() => 'old')();");
+    writeFileSync(entry, entryCode);
+    const asyncResolve = jest.fn(async (what: string, importer: string) => {
+      if (what.startsWith('.')) {
+        return resolve(dirname(importer), what);
+      }
+      return null;
+    });
+    const services = createServices(root, entry, {
+      importOverrides: {
+        './dep.js': { noShake: true },
+      },
+    });
+    const broker = new EvalBroker(services, asyncResolve);
+    const privateBroker = getPrivateBroker(broker);
+
+    try {
+      const initial = await broker.evaluate(
+        Entrypoint.createRoot(services, entry, ['__wywPreval'], entryCode)
+      );
+      expect(initial.values?.get('value')).toBe('old');
+      expect(privateBroker.loadMirror.get(dep)?.only).toContain('*');
+
+      writeFileSync(dep, "export const value = (() => 'fresh')();");
+      services.cache.invalidateForFile(dep);
+      services.cache.invalidateForFile(entry);
+
+      const updated = await broker.evaluate(
+        Entrypoint.createRoot(services, entry, ['__wywPreval'], entryCode)
+      );
+      expect(updated.values?.get('value')).toBe('fresh');
+      expect(readFileSync(entry, 'utf8')).toBe(entryCode);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('enables eval-file debug in the runner only for enabled emitters', async () => {
