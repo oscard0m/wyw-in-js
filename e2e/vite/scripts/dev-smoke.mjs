@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,7 +17,7 @@ const assertTransformed = (result, label) => {
   }
 };
 
-const main = async () => {
+const runBasicDevSmoke = async () => {
   const server = await createServer({
     configFile: false,
     root: PKG_DIR,
@@ -49,6 +50,137 @@ const main = async () => {
   } finally {
     await server.close();
   }
+};
+
+const getLoadedCode = (loaded, label) => {
+  const code = typeof loaded === 'string' ? loaded : loaded?.code;
+  if (typeof code !== 'string') {
+    throw new Error(`${label} was not loaded`);
+  }
+
+  return code;
+};
+
+const runEvalDependencyInvalidationSmoke = async () => {
+  const fixtureDir = await fs.mkdtemp(
+    path.join(PKG_DIR, '.dev-invalidation-fixture-')
+  );
+  const sourceDir = path.join(fixtureDir, 'src');
+  const entryFile = path.join(sourceDir, 'index.ts');
+  const themeFile = path.join(sourceDir, 'theme.ts');
+  const cssFile = path.join(sourceDir, 'index.wyw-in-js.css');
+  const entryUrl = '/src/index.ts';
+  let server;
+  let resolveHotUpdate;
+  const hotUpdateFinished = new Promise((resolve) => {
+    resolveHotUpdate = resolve;
+  });
+  const hmrProbe = {
+    name: 'wyw-eval-invalidation-smoke-probe',
+    enforce: 'post',
+    handleHotUpdate(ctx) {
+      if (path.resolve(ctx.file) !== themeFile) return undefined;
+
+      const affected = [...ctx.modules];
+      setImmediate(() => resolveHotUpdate(affected));
+      return undefined;
+    },
+  };
+
+  try {
+    await fs.mkdir(sourceDir, { recursive: true });
+    await fs.writeFile(
+      entryFile,
+      [
+        "import { css } from '@wyw-in-js/template-tag-syntax';",
+        "import { color } from './theme';",
+        '',
+        'export const className = css`',
+        '  color: ${color};',
+        '`;',
+        '',
+      ].join('\n')
+    );
+    await fs.writeFile(
+      themeFile,
+      "export const color = (() => '#123456')();\n"
+    );
+    const originalEntry = await fs.readFile(entryFile, 'utf8');
+
+    server = await createServer({
+      configFile: false,
+      root: fixtureDir,
+      logLevel: 'error',
+      server: {
+        middlewareMode: 'ssr',
+        hmr: true,
+        watch: { ignored: ['**/*'] },
+      },
+      plugins: [wyw({ eval: { strategy: 'execute' } }), hmrProbe],
+    });
+
+    const initialTransform = await server.transformRequest(entryUrl);
+    assertTransformed(initialTransform, entryUrl);
+    const initialCss = getLoadedCode(
+      await server.pluginContainer.load(cssFile),
+      cssFile
+    );
+    if (!initialCss.includes('#123456') || initialCss.includes('#abcdef')) {
+      throw new Error('Initial dev CSS did not contain the expected value');
+    }
+
+    await fs.writeFile(
+      themeFile,
+      "export const color = (() => '#abcdef')();\n"
+    );
+    server.watcher.emit('change', themeFile);
+    let timeout;
+    const affected = await Promise.race([
+      hotUpdateFinished,
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('Timed out waiting for Vite hot update')),
+          10_000
+        );
+      }),
+    ]).finally(() => clearTimeout(timeout));
+    if (
+      !affected.some(
+        (module) =>
+          module.file === entryFile || module.id?.split('?', 1)[0] === entryFile
+      )
+    ) {
+      throw new Error('Changed eval dependency did not invalidate its root');
+    }
+
+    const updatedTransform = await server.transformRequest(entryUrl);
+    assertTransformed(updatedTransform, entryUrl);
+    const updatedCss = getLoadedCode(
+      await server.pluginContainer.load(cssFile),
+      cssFile
+    );
+    if (!updatedCss.includes('#abcdef') || updatedCss.includes('#123456')) {
+      throw new Error('Updated dev CSS retained a stale dependency value');
+    }
+    if ((await fs.readFile(entryFile, 'utf8')) !== originalEntry) {
+      throw new Error(
+        'The root fixture changed during dependency invalidation'
+      );
+    }
+  } finally {
+    await server?.close();
+    await fs.rm(fixtureDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 100,
+    });
+  }
+};
+
+const main = async () => {
+  await runBasicDevSmoke();
+  await runEvalDependencyInvalidationSmoke();
 };
 
 main().then(

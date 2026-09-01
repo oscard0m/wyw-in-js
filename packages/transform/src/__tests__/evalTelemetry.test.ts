@@ -101,7 +101,7 @@ describe('eval telemetry', () => {
     expect(roots).toHaveLength(2);
     expect(roots[0]).toEqual(
       expect.objectContaining({
-        schemaVersion: 1,
+        schemaVersion: 2,
         root: expect.objectContaining({
           batchIndex: 0,
           batchSize: 2,

@@ -123,6 +123,7 @@ export const createLoadTransmissionTelemetry = ({
   hash,
   hasSerializedExports,
   previouslySent,
+  resetModule,
   sameStorageShape,
   shouldShipCode,
   token,
@@ -132,6 +133,7 @@ export const createLoadTransmissionTelemetry = ({
   hash: string | undefined;
   hasSerializedExports: boolean;
   previouslySent: BrokerMirrorEntry | undefined;
+  resetModule: boolean;
   sameStorageShape: boolean;
   shouldShipCode: boolean;
   token: EvalTelemetryToken;
@@ -144,6 +146,9 @@ export const createLoadTransmissionTelemetry = ({
     mode = 'omission';
   } else if (!previouslySent) {
     mode = 'initial';
+  } else if (resetModule) {
+    mode = 'resend';
+    resendReason = 'invalidation';
   } else {
     mode = 'resend';
     if (previouslySent.hash !== hash) {
@@ -220,6 +225,7 @@ export const sendEvalLoadResult = async (
             codeBytes: successfulChunkCodeBytes,
             incomplete: true,
             logicalResults: 0,
+            moduleReset: payload.resetModule === true,
             wireBytes,
             wireMessages,
           });
@@ -229,6 +235,7 @@ export const sendEvalLoadResult = async (
         telemetry.token.recordLoadTransmission({
           ...telemetry.details,
           chunks,
+          moduleReset: payload.resetModule === true,
           wireBytes,
           wireMessages,
         });
@@ -280,6 +287,7 @@ export const sendEvalLoadResult = async (
         chunkPayload.hash = payload.hash;
         chunkPayload.only = payload.only;
         chunkPayload.exports = payload.exports;
+        chunkPayload.resetModule = payload.resetModule;
         chunkPayload.error = payload.error;
       }
 

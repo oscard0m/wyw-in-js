@@ -292,9 +292,11 @@ const createAccumulator = (
         incompleteResults: 0,
         initial: 0,
         logicalResults: 0,
+        moduleResetSignals: 0,
         omissions: 0,
         resendReasons: {
           'hash-change': 0,
+          invalidation: 0,
           'only-widening': 0,
           'storage-shape-change': 0,
         },
@@ -596,6 +598,9 @@ export const beginEvalTelemetry = (
       counters.wireBytes += toCount(transmission.wireBytes);
       counters.chunks += chunks;
       counters.incompleteResults += transmission.incomplete ? 1 : 0;
+      if (transmission.moduleReset) {
+        counters.moduleResetSignals += logicalResults;
+      }
       if (transmission.codeBytes !== undefined) {
         counters.codeBytes += toCount(transmission.codeBytes);
       } else if (typeof transmission.code === 'string') {

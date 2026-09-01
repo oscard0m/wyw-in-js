@@ -1,4 +1,4 @@
-export const EVAL_TELEMETRY_SCHEMA_VERSION = 1 as const;
+export const EVAL_TELEMETRY_SCHEMA_VERSION = 2 as const;
 
 export const EVAL_PREPARATION_ARTIFACT_LIMIT = 128;
 
@@ -20,6 +20,7 @@ export type EvalLoadCacheOutcome =
 
 export type EvalLoadResendReason =
   | 'hash-change'
+  | 'invalidation'
   | 'only-widening'
   | 'storage-shape-change';
 
@@ -35,6 +36,8 @@ export type EvalLoadTransmission = {
   /** One for a normal result, greater than one only if callers coalesce work. */
   logicalResults?: number;
   mode: 'error' | 'initial' | 'omission' | 'resend' | 'serialized-exports';
+  /** True when the logical result instructs the runner to reset this module. */
+  moduleReset?: boolean;
   resendReason?: EvalLoadResendReason;
   /** Number of physical LOAD_RESULT messages written for the logical result. */
   wireMessages: number;
@@ -151,6 +154,7 @@ export type EvalTelemetryRootRecord = {
       incompleteResults: number;
       initial: number;
       logicalResults: number;
+      moduleResetSignals: number;
       omissions: number;
       resendReasons: Record<EvalLoadResendReason, number>;
       resends: number;
