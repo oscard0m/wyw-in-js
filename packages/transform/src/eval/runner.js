@@ -1118,6 +1118,7 @@ const moduleLastVariant = new Map();
 const linkPromises = new Map();
 const loadInFlight = new Map();
 const externalInFlight = new Map();
+const dynamicEvaluations = new Set();
 const resolveCache = new LruCache(RESOLVE_CACHE_SIZE);
 const resolveInFlight = new Map();
 
@@ -1154,6 +1155,7 @@ const resetModuleState = () => {
   linkPromises.clear();
   loadInFlight.clear();
   externalInFlight.clear();
+  dynamicEvaluations.clear();
   resolveInFlight.clear();
   resolveCache.clear();
   sentNamespaceIdentifiers.clear();
@@ -2443,7 +2445,19 @@ const createDynamicImportFn = (importer, sessionRef) => {
     if (!isSessionActive(sessionId)) return abandonStaleSession();
     await linkModule(resolved, sessionId);
     if (!isSessionActive(sessionId)) return abandonStaleSession();
-    await resolved.evaluate();
+    const evaluation = resolved.evaluate();
+    dynamicEvaluations.add(evaluation);
+    try {
+      await evaluation;
+    } catch (error) {
+      // A fire-and-forget import from an old VM may reject after INIT has
+      // installed a replacement context. Keep that stale promise abandoned
+      // instead of turning its rejection into an unhandled process failure.
+      if (!isSessionActive(sessionId)) return abandonStaleSession();
+      throw error;
+    } finally {
+      dynamicEvaluations.delete(evaluation);
+    }
     if (!isSessionActive(sessionId)) return abandonStaleSession();
     return resolved;
   };
@@ -2690,6 +2704,7 @@ const handleMessage = async (message) => {
             loadResultChunks.size > 0 ||
             loadInFlight.size > 0 ||
             externalInFlight.size > 0 ||
+            dynamicEvaluations.size > 0 ||
             resolveInFlight.size > 0 ||
             linkPromises.size > 0);
         activeSessionId = initSessionId;

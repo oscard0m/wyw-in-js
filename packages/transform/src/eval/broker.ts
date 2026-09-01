@@ -1081,6 +1081,22 @@ const encodeGlobalsCached = (input: unknown): Record<string, unknown> => {
   return encodeGlobals(input) as Record<string, unknown>;
 };
 
+// A scoped broker must distinguish transform-cache lifecycles without keeping
+// the latest cache (and its Entrypoint -> Services -> LoaderContext graph)
+// alive. WeakMap values do not retain their keys when the token has no back
+// reference to the cache.
+const transformCacheSessionTokens = new WeakMap<
+  TransformCacheCollection,
+  object
+>();
+const getTransformCacheSessionToken = (cache: TransformCacheCollection) => {
+  const cached = transformCacheSessionTokens.get(cache);
+  if (cached) return cached;
+  const token = {};
+  transformCacheSessionTokens.set(cache, token);
+  return token;
+};
+
 const formatLoaderResult = (code: string, loader?: string | null) => {
   if (loader === 'json') {
     return `export default ${JSON.stringify(JSON.parse(code))};`;
@@ -1140,6 +1156,8 @@ export class EvalBroker {
   private hasSemanticSession = false;
 
   private semanticSessionKey: string | Services | undefined;
+
+  private semanticSessionCacheToken: object | undefined;
 
   private evalQueue: Promise<void> = Promise.resolve();
 
@@ -1488,9 +1506,13 @@ export class EvalBroker {
     // instead of treating every missing key as one reusable semantic scope.
     const nextSemanticSessionKey =
       activeServices.evalCacheKey ?? activeServices;
+    const nextSemanticSessionCacheToken = getTransformCacheSessionToken(
+      activeServices.cache
+    );
     const reuseModules =
       this.hasSemanticSession &&
-      this.semanticSessionKey === nextSemanticSessionKey;
+      this.semanticSessionKey === nextSemanticSessionKey &&
+      this.semanticSessionCacheToken === nextSemanticSessionCacheToken;
     if (!reuseModules) {
       this.resetSemanticSessionState();
     }
@@ -1498,6 +1520,7 @@ export class EvalBroker {
     // next job must conservatively start a new semantic VM session.
     this.hasSemanticSession = false;
     this.semanticSessionKey = undefined;
+    this.semanticSessionCacheToken = undefined;
     this.activeResolveRootId = resolveRootId;
     this.resetPerEntrypointState(entrypoint);
     this.evalSeq += 1;
@@ -1516,6 +1539,7 @@ export class EvalBroker {
       await this.initRunner(entrypoint, reuseModules);
       this.hasSemanticSession = true;
       this.semanticSessionKey = nextSemanticSessionKey;
+      this.semanticSessionCacheToken = nextSemanticSessionCacheToken;
 
       const payload = await this.request<EvalResultPayload>(
         'EVAL',
@@ -1557,6 +1581,7 @@ export class EvalBroker {
       // that child so no continuation can mutate the next semantic session.
       this.hasSemanticSession = false;
       this.semanticSessionKey = undefined;
+      this.semanticSessionCacheToken = undefined;
       const failedRunner = this.runner;
       if (failedRunner) {
         this.retireRunner(
@@ -1641,6 +1666,11 @@ export class EvalBroker {
 
   private resetPerEntrypointState(entrypoint: Entrypoint) {
     this.requestEpoch += 1;
+    // A completed EVAL may leave a fire-and-forget dynamic import preparing
+    // in the background. Its per-id predecessor belongs to the old request
+    // epoch and must not block a fresh LOAD for the next entrypoint. The old
+    // task's identity-checked finally cannot remove a newer replacement.
+    this.loadInFlight.clear();
     this.runtimeDependenciesByModule.clear();
     this.emittedDependencies.clear();
     this.importsByModule.clear();
@@ -1733,6 +1763,7 @@ export class EvalBroker {
     this.lastHappyDomEnabled = false;
     this.hasSemanticSession = false;
     this.semanticSessionKey = undefined;
+    this.semanticSessionCacheToken = undefined;
     this.activeRunnerSessionId = 0;
     this.requestEpoch += 1;
     this.runnerOutputBuffer = '';
@@ -1766,6 +1797,7 @@ export class EvalBroker {
     this.lastHappyDomEnabled = false;
     this.hasSemanticSession = false;
     this.semanticSessionKey = undefined;
+    this.semanticSessionCacheToken = undefined;
     this.activeRunnerSessionId = 0;
     this.requestEpoch += 1;
     this.runnerOutputBuffer = '';
@@ -1826,6 +1858,7 @@ export class EvalBroker {
       this.lastHappyDomEnabled = false;
       this.hasSemanticSession = false;
       this.semanticSessionKey = undefined;
+      this.semanticSessionCacheToken = undefined;
       this.activeRunnerSessionId = 0;
       this.requestEpoch += 1;
       this.runnerOutputBuffer = '';

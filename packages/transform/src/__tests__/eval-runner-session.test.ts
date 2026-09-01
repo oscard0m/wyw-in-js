@@ -108,7 +108,18 @@ const createHarness = (cwd: string) => {
     );
   };
 
-  return { child, messages, send, take };
+  const waitForStderr = async (pattern: string, timeoutMs = 2_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (stderr.includes(pattern)) return;
+      // eslint-disable-next-line no-await-in-loop
+      await delay(10);
+    }
+
+    throw new Error(`Timed out waiting for stderr pattern: ${pattern}`);
+  };
+
+  return { child, messages, send, take, waitForStderr };
 };
 
 const initMessage = (
@@ -445,6 +456,263 @@ describe('eval runner sessions', () => {
       });
     } finally {
       writeFileSync(releaseExternal, 'release');
+      await stopHarness(harness.child);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fully resets reuse when internal dynamic evaluation is unfinished', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-runner-'));
+    const firstEntry = join(root, 'first.js');
+    const secondEntry = join(root, 'second.js');
+    const slowModule = join(root, 'slow.js');
+    const firstSource = [
+      'export const __wywPreval = {',
+      '  value: () => {',
+      "    void __wyw_dynamic_import('./slow.js');",
+      "    return 'first';",
+      '  },',
+      '};',
+    ].join('\n');
+    const secondSource = [
+      "import { value } from './slow.js';",
+      'export const __wywPreval = { value: () => value };',
+    ].join('\n');
+    writeFileSync(firstEntry, firstSource);
+    writeFileSync(secondEntry, secondSource);
+    writeFileSync(slowModule, '');
+    const harness = createHarness(root);
+
+    try {
+      await harness.send(initMessage('init-first', 1, firstEntry));
+      await harness.take(
+        (message) => message.type === 'INIT_ACK' && message.id === 'init-first'
+      );
+      await harness.send({
+        type: 'EVAL',
+        id: 'eval-first',
+        payload: { id: firstEntry },
+      });
+      const firstLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === firstEntry
+      );
+      await harness.send(
+        loadResult(firstLoad, firstEntry, firstSource, 'first-entry', [
+          '__wywPreval',
+        ])
+      );
+      const firstResolve = await harness.take(
+        (message) =>
+          message.type === 'RESOLVE' &&
+          message.payload?.specifier === './slow.js'
+      );
+      await harness.send({
+        type: 'RESOLVE_RESULT',
+        id: firstResolve.id,
+        payload: { resolvedId: slowModule },
+      });
+      const firstSlowLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === slowModule
+      );
+      await harness.send(
+        loadResult(
+          firstSlowLoad,
+          slowModule,
+          [
+            "console.error('internal-dynamic-evaluation-started');",
+            'await new Promise(() => {});',
+            "export const value = 'old';",
+          ].join('\n'),
+          'slow-old',
+          ['*']
+        )
+      );
+      await harness.take(
+        (message) =>
+          message.type === 'EVAL_RESULT' && message.id === 'eval-first'
+      );
+      await harness.waitForStderr('internal-dynamic-evaluation-started');
+
+      await harness.send(
+        initMessage('init-second', 2, secondEntry, false, true)
+      );
+      const secondInit = await harness.take(
+        (message) => message.type === 'INIT_ACK' && message.id === 'init-second'
+      );
+      expect(secondInit.modulesReset).toBe(true);
+
+      await harness.send({
+        type: 'EVAL',
+        id: 'eval-second',
+        payload: { id: secondEntry },
+      });
+      const secondLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === secondEntry
+      );
+      await harness.send(
+        loadResult(secondLoad, secondEntry, secondSource, 'second-entry', [
+          '__wywPreval',
+        ])
+      );
+      const secondResolve = await harness.take(
+        (message) =>
+          message.type === 'RESOLVE' &&
+          message.payload?.specifier === './slow.js'
+      );
+      await harness.send({
+        type: 'RESOLVE_RESULT',
+        id: secondResolve.id,
+        payload: { resolvedId: slowModule },
+      });
+      const secondSlowLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === slowModule
+      );
+      await harness.send(
+        loadResult(
+          secondSlowLoad,
+          slowModule,
+          "export const value = 'fresh';",
+          'slow-fresh',
+          ['value']
+        )
+      );
+      const result = await harness.take(
+        (message) =>
+          message.type === 'EVAL_RESULT' && message.id === 'eval-second'
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.payload?.values).toEqual({
+        value: { kind: 'string', value: 'fresh' },
+      });
+    } finally {
+      await stopHarness(harness.child);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('absorbs a stale internal dynamic evaluation rejection after reset', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-runner-'));
+    const firstEntry = join(root, 'first.js');
+    const secondEntry = join(root, 'second.js');
+    const slowModule = join(root, 'slow.js');
+    const firstSource = [
+      'export const __wywPreval = {',
+      '  value: () => {',
+      "    void __wyw_dynamic_import('./slow.js');",
+      "    return 'first';",
+      '  },',
+      '};',
+    ].join('\n');
+    const secondSource =
+      "export const __wywPreval = { value: () => 'second' };";
+    writeFileSync(firstEntry, firstSource);
+    writeFileSync(secondEntry, secondSource);
+    writeFileSync(slowModule, '');
+    const harness = createHarness(root);
+
+    try {
+      await harness.send(initMessage('init-first', 1, firstEntry));
+      await harness.take(
+        (message) => message.type === 'INIT_ACK' && message.id === 'init-first'
+      );
+      await harness.send({
+        type: 'EVAL',
+        id: 'eval-first',
+        payload: { id: firstEntry },
+      });
+      const firstLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === firstEntry
+      );
+      await harness.send(
+        loadResult(firstLoad, firstEntry, firstSource, 'first-entry', [
+          '__wywPreval',
+        ])
+      );
+      const firstResolve = await harness.take(
+        (message) =>
+          message.type === 'RESOLVE' &&
+          message.payload?.specifier === './slow.js'
+      );
+      await harness.send({
+        type: 'RESOLVE_RESULT',
+        id: firstResolve.id,
+        payload: { resolvedId: slowModule },
+      });
+      const firstSlowLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === slowModule
+      );
+      await harness.send(
+        loadResult(
+          firstSlowLoad,
+          slowModule,
+          [
+            "console.error('stale-dynamic-rejection-scheduled');",
+            'await new Promise((_, reject) => {',
+            '  let remaining = 500;',
+            '  const tick = () => {',
+            '    if (remaining > 0) {',
+            '      remaining -= 1;',
+            '      process.nextTick(tick);',
+            '      return;',
+            '    }',
+            "    console.error('stale-dynamic-rejecting');",
+            "    reject(new Error('late boom'));",
+            '  };',
+            '  tick();',
+            '});',
+            "export const value = 'never';",
+          ].join('\n'),
+          'slow-reject',
+          ['*']
+        )
+      );
+      await harness.take(
+        (message) =>
+          message.type === 'EVAL_RESULT' && message.id === 'eval-first'
+      );
+      await harness.waitForStderr('stale-dynamic-rejection-scheduled');
+
+      await harness.send(
+        initMessage('init-second', 2, secondEntry, false, true)
+      );
+      const secondInit = await harness.take(
+        (message) => message.type === 'INIT_ACK' && message.id === 'init-second'
+      );
+      expect(secondInit.modulesReset).toBe(true);
+      await harness.send({
+        type: 'EVAL',
+        id: 'eval-second',
+        payload: { id: secondEntry },
+      });
+      const secondLoad = await harness.take(
+        (message) =>
+          message.type === 'LOAD' && message.payload?.id === secondEntry
+      );
+      await harness.send(
+        loadResult(secondLoad, secondEntry, secondSource, 'second-entry', [
+          '__wywPreval',
+        ])
+      );
+      const result = await harness.take(
+        (message) =>
+          message.type === 'EVAL_RESULT' && message.id === 'eval-second'
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.payload?.values).toEqual({
+        value: { kind: 'string', value: 'second' },
+      });
+
+      await harness.waitForStderr('stale-dynamic-rejecting');
+      await delay(100);
+      expect(harness.child.exitCode).toBeNull();
+      expect(harness.child.signalCode).toBeNull();
+    } finally {
       await stopHarness(harness.child);
       rmSync(root, { recursive: true, force: true });
     }
