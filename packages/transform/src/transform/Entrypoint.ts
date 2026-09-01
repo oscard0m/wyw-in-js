@@ -24,6 +24,60 @@ import { recordPipelineEntrypoint } from '../debug/pipelineTelemetry';
 const EMPTY_FILE = '=== empty file ===';
 const DEFAULT_ACTION_CONTEXT = Symbol('defaultActionContext');
 
+// Guards against supersede storms: an oscillating cache invalidation can
+// re-create the same entrypoint with a non-widening `only` on every root
+// request, looping until the process OOMs. Past the limit within a sliding
+// window (it only resets after the entrypoint has been quiet for the full
+// window) the cached entrypoint is reused instead of superseded. Legitimate
+// rebuilds (watch mode saves, parallel bundler graphs) never repeat that fast.
+const SUPERSEDE_STORM_WINDOW_MS = 10_000;
+const SUPERSEDE_STORM_LIMIT = 100;
+
+interface ISupersedeWindow {
+  count: number;
+  lastSeenAt: number;
+  loggedCount: number;
+}
+
+// Keyed by the cache collection so parallel builds and tests don't share state.
+const supersedeWindowsByCache = new WeakMap<
+  object,
+  Map<string, ISupersedeWindow>
+>();
+
+function isSupersedeStorm(services: Services, name: string): boolean {
+  let byName = supersedeWindowsByCache.get(services.cache);
+  if (!byName) {
+    byName = new Map();
+    supersedeWindowsByCache.set(services.cache, byName);
+  }
+
+  const now = Date.now();
+  let window = byName.get(name);
+  if (!window || now - window.lastSeenAt > SUPERSEDE_STORM_WINDOW_MS) {
+    window = { count: 0, lastSeenAt: now, loggedCount: 0 };
+    byName.set(name, window);
+  }
+
+  window.count += 1;
+  window.lastSeenAt = now;
+
+  if (window.count <= SUPERSEDE_STORM_LIMIT) {
+    return false;
+  }
+
+  if (window.loggedCount === 0 || window.count % 1000 === 0) {
+    window.loggedCount = window.count;
+    // eslint-disable-next-line no-console
+    console.error(
+      `[wyw-in-js] supersede storm detected for ${name}: ${window.count} non-widening supersedes within ${SUPERSEDE_STORM_WINDOW_MS}ms. ` +
+        'The cached entrypoint is reused while its content is unchanged. This indicates an oscillating cache invalidation; please report it.'
+    );
+  }
+
+  return true;
+}
+
 type CreateEntrypointOptions = {
   mergeCachedOnly?: boolean;
 };
@@ -369,6 +423,32 @@ export class Entrypoint extends BaseEntrypoint {
       }
 
       return [isLoop ? 'loop' : 'created', cached.supersede(mergedOnly)];
+    }
+
+    if (
+      cached &&
+      !cached.evaluated &&
+      isSuperSet(cached.only, mergedOnly) &&
+      isSupersedeStorm(services, name)
+    ) {
+      // Reuse is only safe when the storm is a false-positive invalidation,
+      // i.e. the bytes are identical. A genuine rapid-rewrite loop (e.g. a
+      // code generator in watch mode) must keep superseding: serving stale
+      // code would be worse than the memory growth, and the storm log keeps
+      // it diagnosable.
+      if (loadedCode === cached.initialCode) {
+        const isLoop = parent && hasLoop(name, parent);
+        cached.log(
+          'supersede storm guard hit, reuse cached entrypoint (%o)',
+          mergedOnly
+        );
+        // 'cached' also skips the redundant cache.add in create(), which
+        // would clobber the entry's dependency snapshot and content hash.
+        return [isLoop ? 'loop' : 'cached', cached];
+      }
+      cached.log(
+        'supersede storm detected, but the code changed; keep superseding'
+      );
     }
 
     const newEntrypoint = new Entrypoint(

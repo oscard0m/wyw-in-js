@@ -95,6 +95,13 @@ export class TransformCacheCollection<
 
   private consumedInvalidationVersions = new Map<string, number>();
 
+  // Files with an unknown dependency graph (entrypoint evicted, no snapshot)
+  // that were already reported as changed once. Answering "changed" on every
+  // check creates an invalidation oscillator (see didDependencyChange); after
+  // the first report, content hashes decide. Entries are cleared when the
+  // file's graph becomes known again.
+  private unknownGraphReported = new Set<string>();
+
   constructor(caches: Partial<ICaches<TEntrypoint>> = {}) {
     this.barrelManifests = caches.barrelManifests || new Map();
     this.entrypoints = caches.entrypoints || new Map();
@@ -146,6 +153,7 @@ export class TransformCacheCollection<
     recordPipelineCacheClear('exports', clearReason, this.exports.size);
     this.exports.clear();
     this.entrypointDependencySnapshots.clear();
+    this.unknownGraphReported.clear();
     this.clearCacheDependencies('all');
   }
 
@@ -194,6 +202,7 @@ export class TransformCacheCollection<
       // dependency graph will be snapshotted at that point, after processing
       // has had a chance to populate the mutable dependency maps.
       this.entrypointDependencySnapshots.delete(cacheKey);
+      this.unknownGraphReported.delete(key);
     }
 
     if ('initialCode' in value) {
@@ -250,6 +259,7 @@ export class TransformCacheCollection<
     cache.clear();
     if (cacheName === 'entrypoints') {
       this.entrypointDependencySnapshots.clear();
+      this.unknownGraphReported.clear();
     }
     this.clearCacheDependencies(cacheName);
   }
@@ -535,15 +545,26 @@ export class TransformCacheCollection<
             this.entrypointDependencySnapshots.has(
               this.getKey(dependencyFilename)
             ) || this.hasCachedDependencies(dependencyFilename);
-          if (
-            !hasKnownDependencyGraph ||
-            this.contentHashes.get(dependencyFilename)?.fs === undefined
-          ) {
+          const fsHash = this.contentHashes.get(dependencyFilename)?.fs;
+          if (!hasKnownDependencyGraph || fsHash === undefined) {
             // A content hash only proves that this file is unchanged. Without
             // a retained graph, an evicted entrypoint may still hide a changed
-            // transitive dependency, so the state remains unknown.
-            dependencyChangeMemo.set(dependencyFilename, true);
-            return true;
+            // transitive dependency, so the state remains unknown. Report it
+            // as changed only once: a permanently unknown graph would
+            // otherwise invalidate and supersede the parent on every check.
+            // Later checks fall through to the content-hash verification below.
+            if (
+              fsHash === undefined ||
+              !this.unknownGraphReported.has(dependencyFilename)
+            ) {
+              this.unknownGraphReported.add(dependencyFilename);
+              cacheLogger(
+                'dependency graph for %s is unknown, conservatively report as changed',
+                dependencyFilename
+              );
+              dependencyChangeMemo.set(dependencyFilename, true);
+              return true;
+            }
           }
 
           // A missing entrypoint can be cache churn. Verify its own source,
@@ -676,6 +697,7 @@ export class TransformCacheCollection<
     }
 
     cache.set(cacheKey, nextDependencies);
+    this.unknownGraphReported.delete(key);
   }
 
   /**
@@ -759,7 +781,10 @@ export class TransformCacheCollection<
     entrypoint: TEntrypoint
   ): void {
     if (entrypoint.isProcessing) {
-      this.forgetEntrypointDependencySnapshot(filename);
+      // Mid-processing dependency maps are incomplete: take no snapshot, but
+      // keep one from an earlier eviction. A stale-but-complete graph still
+      // allows dependency checks; deleting it would leave the file in the
+      // unknown-graph state that forces conservative invalidation.
       return;
     }
 
@@ -777,6 +802,7 @@ export class TransformCacheCollection<
       dependencies: copy(entrypoint.dependencies),
       invalidationDependencies: copy(entrypoint.invalidationDependencies),
     });
+    this.unknownGraphReported.delete(filename);
   }
 
   private forgetEntrypointDependencySnapshot(filename: string): void {
