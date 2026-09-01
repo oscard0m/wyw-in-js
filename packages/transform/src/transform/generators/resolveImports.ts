@@ -406,6 +406,7 @@ export async function* asyncResolveImports(
       return resolveTask;
     })
   );
+  entrypoint.assertNotSuperseded();
 
   log('resolved %d imports', resolvedImports.length);
 
@@ -420,6 +421,7 @@ export async function* asyncResolveImports(
     entrypoint,
     filteredImports
   );
+  entrypoint.assertNotSuperseded();
   emitDependency(eventEmitter, entrypoint, loadedImports, this.data.phase);
   return loadedImports;
 }

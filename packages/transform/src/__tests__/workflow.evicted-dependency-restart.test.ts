@@ -101,7 +101,16 @@ describe('evicted-but-unchanged dependency no longer defeats entrypoint caching'
 
       const depServices = createServices(cache, depFile);
       const depCode = fs.readFileSync(depFile, 'utf-8');
-      Entrypoint.createRoot(depServices, depFile, ['val'], depCode);
+      const depEntrypoint = Entrypoint.createRoot(
+        depServices,
+        depFile,
+        ['val'],
+        depCode
+      );
+      // The real workflow evicts a plain dependency only after its transform
+      // completed. That completion is what makes its dependency graph safe to
+      // retain; a merely-created entrypoint is intentionally still unknown.
+      depEntrypoint.setTransformResult({ code: depCode, metadata: null });
 
       // Record the dependency's `fs` content hash + mtime, exactly as
       // `processImports.ts`'s cached-dependency reuse check

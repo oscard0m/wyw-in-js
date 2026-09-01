@@ -4,10 +4,19 @@ import path from 'path';
 
 import { TransformCacheCollection } from '../cache';
 import { Entrypoint } from '../transform/Entrypoint';
-import { syncActionRunner } from '../transform/actions/actionRunner';
+import {
+  asyncActionRunner,
+  syncActionRunner,
+} from '../transform/actions/actionRunner';
 import { baseProcessingHandlers } from '../transform/generators/baseProcessingHandlers';
-import { processEntrypoint } from '../transform/generators/processEntrypoint';
-import { syncResolveImports } from '../transform/generators/resolveImports';
+import {
+  processEntrypoint,
+  processEntrypointAsync,
+} from '../transform/generators/processEntrypoint';
+import {
+  asyncResolveImports,
+  syncResolveImports,
+} from '../transform/generators/resolveImports';
 import { loadWywOptions } from '../transform/helpers/loadWywOptions';
 import { withDefaultServices } from '../transform/helpers/withDefaultServices';
 import type { IResolveImportsAction } from '../transform/types';
@@ -144,6 +153,49 @@ const runEntrypoint = (
   );
 
   return entrypoint;
+};
+
+const runEntrypointAsync = async (
+  root: string,
+  filename: string,
+  cache: TransformCacheCollection,
+  eventEmitter: EventEmitter,
+  resolve: (what: string, importer: string) => Promise<string | null>
+) => {
+  const services = createServices(root, filename, cache, eventEmitter);
+  const entrypoint = Entrypoint.createRoot(
+    services,
+    filename,
+    ['*'],
+    undefined
+  );
+  if (entrypoint.ignored) {
+    throw new Error(`Unexpected ignored entrypoint ${filename}`);
+  }
+
+  const handlers = {
+    ...baseProcessingHandlers,
+    processEntrypoint: processEntrypointAsync,
+    resolveImports(this: IResolveImportsAction) {
+      return asyncResolveImports.call(this, resolve);
+    },
+  };
+
+  await asyncActionRunner(
+    entrypoint.createAction('processEntrypoint', undefined, null),
+    handlers
+  );
+
+  return entrypoint;
+};
+
+const createDeferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+
+  return { promise, resolve };
 };
 
 const getDependencyEventsForFile = (
@@ -766,6 +818,74 @@ describe('barrel optimization', () => {
       );
       expect(second.transformedCode).toContain(fooBFile);
       expect(second.transformedCode).not.toContain(fooAFile);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not publish stale barrel analysis after its root lifecycle is reset', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wyw-barrel-race-'));
+
+    try {
+      const barrelFile = path.join(root, 'barrel.ts');
+      const consumerFile = path.join(root, 'consumer.ts');
+      const leafAFile = path.join(root, 'leaf-a.ts');
+      const leafBFile = path.join(root, 'leaf-b.ts');
+      const consumerCode =
+        `import { value } from './barrel';\n` +
+        `export const result = value;\n`;
+      fs.writeFileSync(barrelFile, `export { value } from './leaf-a';\n`);
+      fs.writeFileSync(leafAFile, `export const value = 'a';\n`);
+      fs.writeFileSync(leafBFile, `export const value = 'b';\n`);
+      fs.writeFileSync(consumerFile, consumerCode);
+
+      const cache = new TransformCacheCollection();
+      const started = createDeferred();
+      const unblock = createDeferred();
+      const resolve = createResolver(root);
+      let didBlock = false;
+      const gatedResolve = async (what: string, importer: string) => {
+        const resolved = resolve(what, importer);
+        if (!didBlock && importer === barrelFile && what === './leaf-a') {
+          didBlock = true;
+          started.resolve();
+          await unblock.promise;
+        }
+
+        return resolved;
+      };
+
+      const staleTransform = runEntrypointAsync(
+        root,
+        consumerFile,
+        cache,
+        createRecorder().eventEmitter,
+        gatedResolve
+      );
+      await started.promise;
+
+      fs.writeFileSync(barrelFile, `export { value } from './leaf-b';\n`);
+      const resetError = cache.beginUnknownGraphRecovery(
+        consumerFile,
+        new Set([barrelFile]),
+        consumerCode,
+        {}
+      );
+      unblock.resolve();
+
+      await expect(staleTransform).rejects.toBe(resetError);
+      expect(cache.get('barrelManifests', barrelFile)).toBeUndefined();
+      expect(cache.get('exports', barrelFile)).toBeUndefined();
+
+      const fresh = await runEntrypointAsync(
+        root,
+        consumerFile,
+        cache,
+        createRecorder().eventEmitter,
+        async (what, importer) => resolve(what, importer)
+      );
+      expect(fresh.transformedCode).toContain(leafBFile);
+      expect(fresh.transformedCode).not.toContain(leafAFile);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

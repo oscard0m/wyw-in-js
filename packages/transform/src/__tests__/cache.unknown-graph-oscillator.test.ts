@@ -3,10 +3,10 @@ import fs from 'node:fs';
 import { TransformCacheCollection } from '../cache';
 import type { IEntrypointDependency } from '../transform/Entrypoint.types';
 
-// Mocking the minimal interface needed by the cache
 type MockEntrypoint = {
   dependencies: Map<string, Pick<IEntrypointDependency, 'resolved'>>;
   generation: number;
+  hasTransformResult?: boolean;
   initialCode?: string;
   isProcessing?: boolean;
   invalidateOnDependencyChange?: Set<string>;
@@ -15,28 +15,28 @@ type MockEntrypoint = {
     Pick<IEntrypointDependency, 'resolved'>
   >;
   name: string;
+  transformed?: boolean;
 };
 
 const mockedReadFileSync = jest.spyOn(fs, 'readFileSync');
 const mockedStatSync = jest.spyOn(fs, 'statSync');
 
-// Regression test for the supersede-storm OOM: a dependency whose entrypoint
-// was evicted mid-processing has no dependency snapshot, so its graph is
-// unknown. `didDependencyChange` used to answer "changed" for such a file on
-// every check, which invalidated the parent on every root request; each
-// invalidation superseded the parent entrypoint and re-armed the same check,
-// looping (observed at 10k+ generations of one entrypoint) until the loader
-// process ran out of memory. The unknown graph must be reported as changed
-// exactly once; afterwards the dependency's own content hash decides.
-describe('TransformCacheCollection: unknown-graph dependency oscillator', () => {
+// An evicted processing entrypoint has no trustworthy mutable dependency map.
+// Until a complete graph is restored, cache checks must remain conservative:
+// treating the file's own hash as sufficient can hide a changed transitive
+// dependency. A completed Entrypoint lifecycle can publish a safe snapshot.
+describe('TransformCacheCollection: unknown dependency graph', () => {
   const depName = 'dep.js';
-  const depContent = 'export const token = "red";';
+  const depContent = 'export { token } from "./leaf.js";';
+  const leafName = 'leaf.js';
+  const leafContent = 'export const token = "red";';
   const parentName = 'parent.js';
   const parentContent = 'import { token } from "./dep.js"; console.log(token);';
 
   let cache: TransformCacheCollection<MockEntrypoint>;
   let parentDependencies: MockEntrypoint['dependencies'];
-  let depContentOnDisk: string;
+  let leafContentOnDisk: string;
+  let leafMtime: number;
 
   const reArmParent = (generation: number) => {
     cache.add('entrypoints', parentName, {
@@ -48,21 +48,48 @@ describe('TransformCacheCollection: unknown-graph dependency oscillator', () => 
     });
   };
 
+  const publishCompleteGraph = (
+    filename: string,
+    initialCode: string,
+    dependencies: MockEntrypoint['dependencies'],
+    generation = 1
+  ) => {
+    cache.add('entrypoints', filename, {
+      name: filename,
+      initialCode,
+      dependencies,
+      invalidationDependencies: new Map(),
+      generation,
+    });
+    cache.delete('entrypoints', filename);
+  };
+
+  const restoreDepGraph = () => {
+    publishCompleteGraph(
+      depName,
+      depContent,
+      new Map([['./leaf.js', { resolved: leafName }]])
+    );
+  };
+
   afterAll(() => {
     mockedReadFileSync.mockRestore();
     mockedStatSync.mockRestore();
   });
 
   beforeEach(() => {
-    depContentOnDisk = depContent;
+    leafContentOnDisk = leafContent;
+    leafMtime = 200;
     mockedStatSync.mockReset();
     mockedStatSync.mockImplementation((path) => {
       if (path === depName) return { mtimeMs: 123 } as fs.Stats;
+      if (path === leafName) return { mtimeMs: leafMtime } as fs.Stats;
       throw new Error(`Unexpected statSync call: ${String(path)}`);
     });
     mockedReadFileSync.mockReset();
     mockedReadFileSync.mockImplementation((path) => {
-      if (path === depName) return depContentOnDisk;
+      if (path === depName) return depContent;
+      if (path === leafName) return leafContentOnDisk;
       throw new Error(`Unexpected readFileSync call: ${String(path)}`);
     });
 
@@ -70,9 +97,10 @@ describe('TransformCacheCollection: unknown-graph dependency oscillator', () => 
     parentDependencies = new Map([['./dep.js', { resolved: depName }]]);
     reArmParent(1);
 
-    // Record the dependency's fs content hash + mtime, then evict its
-    // entrypoint while it is processing: no dependency snapshot is taken, so
-    // the dependency ends up in the "unknown graph" state.
+    cache.invalidateIfChanged(leafName, leafContent, undefined, 'fs');
+    // A completed leaf entrypoint publishes an explicitly empty graph. A
+    // content hash alone cannot prove that an evicted module has no imports.
+    publishCompleteGraph(leafName, leafContent, new Map());
     cache.add('entrypoints', depName, {
       name: depName,
       initialCode: depContent,
@@ -85,41 +113,152 @@ describe('TransformCacheCollection: unknown-graph dependency oscillator', () => 
     cache.delete('entrypoints', depName);
   });
 
-  it('reports the unknown graph as changed exactly once while the content is unchanged', () => {
+  it('stays conservative until a complete graph is restored', () => {
     expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
 
-    // Each invalidation evicts the parent, and the transform pipeline re-adds
-    // a superseding entrypoint sharing the same dependencies map. Reproduce
-    // that re-arming pattern: the check must stay converged instead of
-    // reporting "changed" forever.
-    for (let i = 0; i < 5; i += 1) {
-      reArmParent(i + 2);
-      expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(false);
-    }
-  });
-
-  it('still catches a real content change after the one-time report', () => {
-    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
     reArmParent(2);
-    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(false);
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
 
-    depContentOnDisk = 'export const token = "blue";';
+    restoreDepGraph();
     reArmParent(3);
-    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
-
-    // The new hash is recorded, so the check converges again.
-    reArmParent(4);
     expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(false);
   });
 
-  it('reports the unknown graph again once the dependency graph was known in between', () => {
+  it('does not publish an unfinished graph before processing starts', () => {
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 2,
+      transformed: false,
+    });
+    cache.delete('entrypoints', depName);
+
     expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
-    reArmParent(2);
+  });
+
+  it.each(['exports', 'barrelManifests'] as const)(
+    'does not mistake auxiliary %s dependencies for a complete graph',
+    (cacheName) => {
+      cache.setCacheDependencies(cacheName, depName, [leafName]);
+
+      expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+    }
+  );
+
+  it('detects a changed transitive leaf after graph repair', () => {
+    restoreDepGraph();
     expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(false);
 
-    // The dependency gets a live entrypoint again (its graph becomes known),
-    // then is evicted mid-processing once more: back to unknown, which is
-    // worth one more conservative report.
+    leafContentOnDisk = 'export const token = "blue";';
+    leafMtime += 1;
+    reArmParent(2);
+
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+    expect(mockedReadFileSync).toHaveBeenCalledWith(leafName, 'utf8');
+  });
+
+  it('retains forced content checks in a complete dependency snapshot', () => {
+    cache.add('entrypoints', leafName, {
+      name: leafName,
+      initialCode: leafContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 2,
+    });
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map([
+        ['./leaf.js', { resolved: leafName }],
+      ]),
+      invalidateOnDependencyChange: new Set([leafName]),
+      generation: 2,
+    });
+    cache.delete('entrypoints', depName);
+
+    // Keep the mtime unchanged: the retained marker must force a content hash
+    // check for dependencies whose bytes affect generated output.
+    leafContentOnDisk = 'export const token = "blue";';
+
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+    expect(mockedReadFileSync).toHaveBeenCalledWith(leafName, 'utf8');
+  });
+
+  it('does not reuse a normal memo result for a forced content check', () => {
+    const ordinaryName = 'ordinary.js';
+    const ordinaryContent = 'export { token } from "./leaf.js";';
+    const forcedName = 'forced.js';
+    const forcedContent = 'export { token } from "./leaf.js";';
+
+    mockedStatSync.mockImplementation((path) => {
+      if (path === ordinaryName || path === forcedName) {
+        return { mtimeMs: 300 } as fs.Stats;
+      }
+      if (path === leafName) return { mtimeMs: leafMtime } as fs.Stats;
+      throw new Error(`Unexpected statSync call: ${String(path)}`);
+    });
+    mockedReadFileSync.mockImplementation((path) => {
+      if (path === ordinaryName) return ordinaryContent;
+      if (path === forcedName) return forcedContent;
+      if (path === leafName) return leafContentOnDisk;
+      throw new Error(`Unexpected readFileSync call: ${String(path)}`);
+    });
+
+    cache = new TransformCacheCollection<MockEntrypoint>();
+    cache.invalidateIfChanged(leafName, leafContent, undefined, 'fs');
+    cache.add('entrypoints', leafName, {
+      name: leafName,
+      initialCode: leafContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 1,
+    });
+
+    cache.invalidateIfChanged(ordinaryName, ordinaryContent, undefined, 'fs');
+    cache.add('entrypoints', ordinaryName, {
+      name: ordinaryName,
+      initialCode: ordinaryContent,
+      dependencies: new Map([['./leaf.js', { resolved: leafName }]]),
+      invalidationDependencies: new Map(),
+      generation: 1,
+    });
+
+    cache.invalidateIfChanged(forcedName, forcedContent, undefined, 'fs');
+    cache.add('entrypoints', forcedName, {
+      name: forcedName,
+      initialCode: forcedContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map([
+        ['./leaf.js', { resolved: leafName }],
+      ]),
+      invalidateOnDependencyChange: new Set([leafName]),
+      generation: 1,
+    });
+
+    cache.add('entrypoints', parentName, {
+      name: parentName,
+      initialCode: parentContent,
+      dependencies: new Map([
+        ['./ordinary.js', { resolved: ordinaryName }],
+        ['./forced.js', { resolved: forcedName }],
+      ]),
+      invalidationDependencies: new Map(),
+      generation: 1,
+    });
+
+    // Both paths reach the same live leaf at the same mtime. The ordinary path
+    // memoizes "unchanged" first; the forced path must still hash the bytes.
+    leafContentOnDisk = 'export const token = "blue";';
+
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+    expect(mockedReadFileSync).toHaveBeenCalledWith(leafName, 'utf8');
+  });
+
+  it('uses the last complete graph while a replacement is still processing', () => {
+    restoreDepGraph();
     cache.add('entrypoints', depName, {
       name: depName,
       initialCode: depContent,
@@ -128,11 +267,160 @@ describe('TransformCacheCollection: unknown-graph dependency oscillator', () => 
       generation: 2,
       isProcessing: true,
     });
+
+    leafContentOnDisk = 'export const token = "blue";';
+    leafMtime += 1;
+
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+  });
+
+  it('uses the last complete graph before a replacement starts processing', () => {
+    restoreDepGraph();
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 2,
+      transformed: false,
+    });
+
+    leafContentOnDisk = 'export const token = "blue";';
+    leafMtime += 1;
+
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+  });
+
+  it('keeps the last complete graph when a replacement is evicted mid-processing', () => {
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map([['./leaf.js', { resolved: leafName }]]),
+      invalidationDependencies: new Map(),
+      generation: 2,
+    });
     cache.delete('entrypoints', depName);
 
-    reArmParent(3);
-    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
-    reArmParent(4);
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 3,
+      isProcessing: true,
+    });
+    cache.delete('entrypoints', depName);
+
     expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(false);
+
+    leafContentOnDisk = 'export const token = "blue";';
+    leafMtime += 1;
+    reArmParent(4);
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+  });
+
+  it('snapshots a complete graph before a direct replacement', () => {
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map([['./leaf.js', { resolved: leafName }]]),
+      invalidationDependencies: new Map(),
+      generation: 2,
+    });
+
+    // Deferred supersede replaces the cache entry directly, without delete().
+    cache.add('entrypoints', depName, {
+      name: depName,
+      initialCode: depContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 3,
+      hasTransformResult: false,
+    });
+    cache.delete('entrypoints', depName);
+
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(false);
+
+    leafContentOnDisk = 'export const token = "blue";';
+    leafMtime += 1;
+    reArmParent(4);
+    expect(cache.invalidateIfChanged(parentName, parentContent)).toBe(true);
+  });
+
+  it('preserves pending recovery evidence for other roots across a lifecycle reset', () => {
+    const otherName = 'other.js';
+    const otherDependency = 'other-dependency.js';
+    const otherContent = 'import "./other-dependency.js";';
+
+    cache.beginUnknownGraphRecovery(
+      parentName,
+      new Set([depName]),
+      parentContent,
+      {}
+    );
+    cache.beginUnknownGraphRecovery(
+      otherName,
+      new Set([otherDependency]),
+      otherContent,
+      {}
+    );
+
+    expect(
+      cache.invalidateIfChangedWithDetails(parentName, parentContent, 'loaded')
+        .unknownDependencyGraphs
+    ).toEqual(new Set([depName]));
+    expect(
+      cache.invalidateIfChangedWithDetails(otherName, otherContent, 'loaded')
+        .unknownDependencyGraphs
+    ).toEqual(new Set([otherDependency]));
+  });
+
+  it('scopes a recovery bypass to the active lifecycle', () => {
+    const recoveryToken = {};
+    cache.beginUnknownGraphRecovery(
+      parentName,
+      new Set([depName]),
+      parentContent,
+      recoveryToken
+    );
+
+    expect(
+      cache.invalidateIfChangedWithDetails(
+        parentName,
+        parentContent,
+        'loaded',
+        recoveryToken
+      ).unknownDependencyGraphs
+    ).toEqual(new Set());
+    expect(
+      cache.invalidateIfChangedWithDetails(parentName, parentContent, 'loaded')
+        .unknownDependencyGraphs
+    ).toEqual(new Set([depName]));
+  });
+
+  it('does not let a detached entrypoint declare recovery complete', () => {
+    cache.beginUnknownGraphRecovery(
+      parentName,
+      new Set([depName]),
+      parentContent,
+      {}
+    );
+    const detached = {
+      name: parentName,
+      initialCode: parentContent,
+      dependencies: new Map(),
+      invalidationDependencies: new Map(),
+      generation: 2,
+      hasTransformResult: false,
+    };
+    cache.add('entrypoints', parentName, detached);
+    cache.delete('entrypoints', parentName);
+
+    cache.completeUnknownGraphRecovery(parentName, detached);
+
+    expect(
+      cache.invalidateIfChangedWithDetails(parentName, parentContent, 'loaded')
+        .unknownDependencyGraphs
+    ).toEqual(new Set([depName]));
   });
 });

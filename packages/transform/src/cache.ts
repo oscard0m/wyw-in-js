@@ -35,16 +35,27 @@ function isMissingFileError(error: unknown): boolean {
 
 interface IBaseCachedEntrypoint {
   dependencies: Map<string, { resolved: string | null }>;
+  hasTransformResult?: boolean;
   initialCode?: string;
   isProcessing?: boolean;
   invalidateOnDependencyChange?: Set<string>;
   invalidationDependencies?: Map<string, { resolved: string | null }>;
+  transformed?: boolean;
 }
 
 type EntrypointDependencySnapshot = Pick<
   IBaseCachedEntrypoint,
-  'dependencies' | 'invalidationDependencies'
+  'dependencies' | 'invalidationDependencies' | 'invalidateOnDependencyChange'
 >;
+
+const isEntrypointGraphIncomplete = (
+  entrypoint: IBaseCachedEntrypoint | undefined
+) =>
+  Boolean(
+    entrypoint?.isProcessing ||
+      entrypoint?.transformed === false ||
+      entrypoint?.hasTransformResult === false
+  );
 
 interface ICaches<TEntrypoint extends IBaseCachedEntrypoint> {
   barrelManifests: Map<string, BarrelManifestCacheEntry>;
@@ -53,6 +64,16 @@ interface ICaches<TEntrypoint extends IBaseCachedEntrypoint> {
 }
 
 type MapValue<T> = T extends Map<string, infer V> ? V : never;
+
+interface IGraphTraversalTokenOwner {
+  getLifecycleError(version: number): Error | null;
+  getLifecycleVersion(): number;
+}
+
+const graphTraversalTokenStates = new WeakMap<
+  object,
+  { owner: IGraphTraversalTokenOwner; version: number }
+>();
 
 const cacheLogger = logger.extend('cache');
 
@@ -95,12 +116,20 @@ export class TransformCacheCollection<
 
   private consumedInvalidationVersions = new Map<string, number>();
 
-  // Files with an unknown dependency graph (entrypoint evicted, no snapshot)
-  // that were already reported as changed once. Answering "changed" on every
-  // check creates an invalidation oscillator (see didDependencyChange); after
-  // the first report, content hashes decide. Entries are cleared when the
-  // file's graph becomes known again.
-  private unknownGraphReported = new Set<string>();
+  private resetVersion = 0;
+
+  private lifecycleError: Error | null = null;
+
+  private lifecycleVersion = 0;
+
+  private readonly pendingUnknownGraphs = new Map<
+    string,
+    {
+      dependencies: Set<string>;
+      recoveryToken: object;
+      sourceHash: string;
+    }
+  >();
 
   constructor(caches: Partial<ICaches<TEntrypoint>> = {}) {
     this.barrelManifests = caches.barrelManifests || new Map();
@@ -116,6 +145,7 @@ export class TransformCacheCollection<
     }
 
     this.keySalt = keySalt;
+    this.resetVersion += 1;
 
     if (prevKeySalt === null && keySalt) {
       recordPipelineCacheSalt(prevKeySalt, keySalt, 'migrate');
@@ -153,7 +183,7 @@ export class TransformCacheCollection<
     recordPipelineCacheClear('exports', clearReason, this.exports.size);
     this.exports.clear();
     this.entrypointDependencySnapshots.clear();
-    this.unknownGraphReported.clear();
+    this.pendingUnknownGraphs.clear();
     this.clearCacheDependencies('all');
   }
 
@@ -164,6 +194,115 @@ export class TransformCacheCollection<
 
   public getKeySalt() {
     return this.keySalt;
+  }
+
+  public getLifecycleVersion(): number {
+    return this.lifecycleVersion;
+  }
+
+  public getResetVersion(): number {
+    return this.resetVersion;
+  }
+
+  public getLifecycleError(version: number): Error | null {
+    return version === this.lifecycleVersion ? null : this.lifecycleError;
+  }
+
+  public createGraphTraversalToken(): object {
+    const token = {};
+    graphTraversalTokenStates.set(token, {
+      owner: this,
+      version: this.lifecycleVersion,
+    });
+    return token;
+  }
+
+  public getGraphTraversalTokenError(token: object): Error | null {
+    const state = graphTraversalTokenStates.get(token);
+    if (!state) {
+      return null;
+    }
+
+    const owner = state.owner === this ? this : state.owner;
+    if (owner.getLifecycleVersion() === state.version) return null;
+
+    return (
+      owner.getLifecycleError(state.version) ??
+      Object.assign(
+        new Error(
+          '[wyw-in-js] Dependency-graph traversal outlived its cache lifecycle.'
+        ),
+        { name: 'StaleDependencyGraphTraversalError' }
+      )
+    );
+  }
+
+  public beginUnknownGraphRecovery(
+    filename: string,
+    unknownDependencies: ReadonlySet<string>,
+    sourceCode: string,
+    recoveryToken: object
+  ): Error {
+    const error = Object.assign(
+      new Error(
+        `[wyw-in-js] Resetting transform and evaluation caches for ${filename} because the dependency graph is incomplete (${[
+          ...unknownDependencies,
+        ].join(', ')}).`
+      ),
+      {
+        code: 'WYW_UNKNOWN_DEPENDENCY_GRAPH_RESET',
+        name: 'UnknownDependencyGraphResetError',
+      }
+    );
+
+    this.beginFailClosedRecovery(error);
+    graphTraversalTokenStates.set(recoveryToken, {
+      owner: this,
+      version: this.lifecycleVersion,
+    });
+    this.pendingUnknownGraphs.set(filename, {
+      dependencies: new Set(unknownDependencies),
+      recoveryToken,
+      sourceHash: hashContent(sourceCode),
+    });
+    return error;
+  }
+
+  public completeUnknownGraphRecovery(
+    filename: string,
+    publishedEntrypoint?: TEntrypoint
+  ): void {
+    if (
+      publishedEntrypoint !== undefined &&
+      this.get('entrypoints', filename) !== publishedEntrypoint
+    ) {
+      return;
+    }
+
+    this.pendingUnknownGraphs.delete(filename);
+  }
+
+  public beginSupersedeStormRecovery(error: Error): void {
+    this.beginFailClosedRecovery(error);
+  }
+
+  private beginFailClosedRecovery(error: Error): void {
+    const pendingUnknownGraphs = new Map(this.pendingUnknownGraphs);
+    const { resetVersion } = this;
+    this.lifecycleVersion += 1;
+    this.lifecycleError = error;
+    this.clear('all');
+    // This is an internal recovery attempt, not an explicit configuration or
+    // user cache reset. Preserve the supersede budget across retries so a
+    // graph that never converges still reaches the bounded diagnostic.
+    this.resetVersion = resetVersion;
+    pendingUnknownGraphs.forEach((pending, filename) => {
+      this.pendingUnknownGraphs.set(filename, pending);
+    });
+    this.contentHashes.clear();
+    this.fileMtimes.clear();
+    this.invalidatedFiles.clear();
+    this.consumedInvalidationVersions.clear();
   }
 
   public add<
@@ -194,16 +333,31 @@ export class TransformCacheCollection<
       return;
     }
 
+    if (cacheName === 'entrypoints') {
+      const previous = cache.get(cacheKey) as TEntrypoint | undefined;
+      if (previous && previous !== (value as unknown as TEntrypoint)) {
+        // Direct replacement (for example applyDeferredSupersede) bypasses
+        // invalidate/delete. Preserve the previous completed graph before an
+        // unfinished successor replaces it.
+        this.snapshotEntrypointDependencies(key, previous);
+      }
+    }
+
     this.clearCacheDependencies(cacheName, key);
     cache.set(cacheKey, value);
 
-    if (cacheName === 'entrypoints') {
-      // A live entrypoint is authoritative. If it is evicted later, its
-      // dependency graph will be snapshotted at that point, after processing
-      // has had a chance to populate the mutable dependency maps.
-      this.entrypointDependencySnapshots.delete(cacheKey);
-      this.unknownGraphReported.delete(key);
+    if (
+      cacheName === 'entrypoints' &&
+      !isEntrypointGraphIncomplete(value as unknown as IBaseCachedEntrypoint)
+    ) {
+      this.completeUnknownGraphRecovery(key);
     }
+
+    // Keep the last complete entrypoint snapshot while a replacement is live.
+    // Its dependency maps are incomplete while it is processing, so checks
+    // merge them with the retained graph. If the replacement is evicted before
+    // it finishes, the previous complete graph remains the safe fallback. A
+    // real source change explicitly forgets it in invalidateIfChanged.
 
     if ('initialCode' in value) {
       const maybeOriginalCode = (value as unknown as { originalCode?: unknown })
@@ -258,8 +412,9 @@ export class TransformCacheCollection<
     recordPipelineCacheClear(cacheName, 'explicit', cache.size);
     cache.clear();
     if (cacheName === 'entrypoints') {
+      this.resetVersion += 1;
       this.entrypointDependencySnapshots.clear();
-      this.unknownGraphReported.clear();
+      this.pendingUnknownGraphs.clear();
     }
     this.clearCacheDependencies(cacheName);
   }
@@ -348,6 +503,76 @@ export class TransformCacheCollection<
     dependencyChangeMemo = new Map<string, boolean>(),
     forceContentCheck = false
   ) {
+    return this.invalidateIfChangedInternal(
+      filename,
+      content,
+      previousVisitedFiles,
+      source,
+      changedFiles,
+      dependencyChangeMemo,
+      forceContentCheck,
+      new Set(),
+      undefined
+    );
+  }
+
+  public invalidateIfChangedWithDetails(
+    filename: string,
+    content: string,
+    source: 'fs' | 'loaded' = 'loaded',
+    graphTraversalToken?: object
+  ): {
+    changed: boolean;
+    unknownDependencyGraphs: Set<string>;
+  } {
+    const graphTraversalTokenError = graphTraversalToken
+      ? this.getGraphTraversalTokenError(graphTraversalToken)
+      : null;
+    if (graphTraversalTokenError) {
+      throw graphTraversalTokenError;
+    }
+
+    const pendingUnknownGraph = this.pendingUnknownGraphs.get(filename);
+    const sourceHash = hashContent(content);
+    const unknownDependencyGraphs = new Set<string>();
+    if (pendingUnknownGraph) {
+      if (pendingUnknownGraph.sourceHash !== sourceHash) {
+        // A genuine root edit begins a new recovery lineage. Unknown edges
+        // found while inspecting the new source below will be recorded
+        // separately.
+        this.pendingUnknownGraphs.delete(filename);
+      } else if (pendingUnknownGraph.recoveryToken !== graphTraversalToken) {
+        pendingUnknownGraph.dependencies.forEach((dependency) => {
+          unknownDependencyGraphs.add(dependency);
+        });
+      }
+    }
+    const changed = this.invalidateIfChangedInternal(
+      filename,
+      content,
+      undefined,
+      source,
+      new Set(),
+      new Map(),
+      false,
+      unknownDependencyGraphs,
+      graphTraversalToken
+    );
+
+    return { changed, unknownDependencyGraphs };
+  }
+
+  private invalidateIfChangedInternal(
+    filename: string,
+    content: string,
+    previousVisitedFiles: Set<string> | undefined,
+    source: 'fs' | 'loaded',
+    changedFiles: Set<string>,
+    dependencyChangeMemo: Map<string, boolean>,
+    forceContentCheck: boolean,
+    unknownDependencyGraphs: Set<string>,
+    graphTraversalToken?: object
+  ): boolean {
     if (changedFiles.has(filename)) {
       return true;
     }
@@ -358,11 +583,15 @@ export class TransformCacheCollection<
 
     if (
       !visitedFiles.has(filename) &&
-      (fileEntrypoint || this.hasCachedDependencies(filename))
+      (fileEntrypoint ||
+        this.entrypointDependencySnapshots.has(this.getKey(filename)) ||
+        this.hasCachedDependencies(filename))
     ) {
       visitedFiles.add(filename);
-      const invalidateOnDependencyChange =
-        fileEntrypoint?.invalidateOnDependencyChange;
+      const invalidateOnDependencyChange = this.getInvalidateOnDependencyChange(
+        filename,
+        fileEntrypoint
+      );
       const dependenciesToCheck = this.getDependenciesToCheck(
         filename,
         fileEntrypoint
@@ -377,9 +606,11 @@ export class TransformCacheCollection<
             visitedFiles,
             changedFiles,
             dependencyChangeMemo,
+            unknownDependencyGraphs,
             forceContentCheck ||
               invalidateOnDependencyChange?.has(dependencyFilename) ||
-              false
+              false,
+            graphTraversalToken
           );
 
           if (
@@ -449,20 +680,31 @@ export class TransformCacheCollection<
     fileEntrypoint?: TEntrypoint
   ): Map<string, { resolved: string | null }> {
     const dependenciesToCheck = new Map<string, { resolved: string | null }>();
-    const dependencySource =
-      fileEntrypoint ??
-      this.entrypointDependencySnapshots.get(this.getKey(filename));
+    const snapshot = this.entrypointDependencySnapshots.get(
+      this.getKey(filename)
+    );
+    const graphMayBeIncomplete = isEntrypointGraphIncomplete(fileEntrypoint);
+    const dependencySources =
+      fileEntrypoint && graphMayBeIncomplete && snapshot
+        ? [snapshot, fileEntrypoint]
+        : [fileEntrypoint ?? snapshot];
 
-    for (const [key, dependency] of dependencySource?.dependencies ?? []) {
-      dependenciesToCheck.set(key, dependency);
-    }
+    for (const [sourceIndex, dependencySource] of dependencySources.entries()) {
+      for (const [key, dependency] of dependencySource?.dependencies ?? []) {
+        const graphKey =
+          dependencySources.length === 1 ? key : `${sourceIndex}:${key}`;
+        dependenciesToCheck.set(graphKey, dependency);
+      }
 
-    for (const [
-      key,
-      dependency,
-    ] of dependencySource?.invalidationDependencies ?? []) {
-      if (!dependenciesToCheck.has(key)) {
-        dependenciesToCheck.set(key, dependency);
+      for (const [
+        key,
+        dependency,
+      ] of dependencySource?.invalidationDependencies ?? []) {
+        const graphKey =
+          dependencySources.length === 1 ? key : `${sourceIndex}:${key}`;
+        if (!dependenciesToCheck.has(graphKey)) {
+          dependenciesToCheck.set(graphKey, dependency);
+        }
       }
     }
 
@@ -481,18 +723,47 @@ export class TransformCacheCollection<
     return dependenciesToCheck;
   }
 
+  private getInvalidateOnDependencyChange(
+    filename: string,
+    fileEntrypoint?: TEntrypoint
+  ): Set<string> | undefined {
+    const snapshot = this.entrypointDependencySnapshots.get(
+      this.getKey(filename)
+    );
+    if (
+      fileEntrypoint &&
+      isEntrypointGraphIncomplete(fileEntrypoint) &&
+      snapshot
+    ) {
+      return new Set([
+        ...(snapshot.invalidateOnDependencyChange ?? []),
+        ...(fileEntrypoint.invalidateOnDependencyChange ?? []),
+      ]);
+    }
+
+    return (
+      fileEntrypoint?.invalidateOnDependencyChange ??
+      snapshot?.invalidateOnDependencyChange
+    );
+  }
+
   private didDependencyChange(
     dependencyFilename: string,
     visitedFiles: Set<string>,
     changedFiles: Set<string>,
     dependencyChangeMemo: Map<string, boolean>,
-    forceContentCheck = false
+    unknownDependencyGraphs: Set<string>,
+    forceContentCheck = false,
+    graphTraversalToken?: object
   ): boolean {
     if (changedFiles.has(dependencyFilename)) {
       return true;
     }
 
-    const memoized = dependencyChangeMemo.get(dependencyFilename);
+    const dependencyMemoKey = `${
+      forceContentCheck ? 'forced' : 'normal'
+    }\0${dependencyFilename}`;
+    const memoized = dependencyChangeMemo.get(dependencyMemoKey);
     if (memoized !== undefined) {
       return memoized;
     }
@@ -504,6 +775,24 @@ export class TransformCacheCollection<
     const strippedDependencyFilename = stripQueryAndHash(dependencyFilename);
     const cachedMtime = this.fileMtimes.get(dependencyFilename);
     const cachedEntrypoint = this.get('entrypoints', dependencyFilename);
+    const hasRetainedSnapshot = this.entrypointDependencySnapshots.has(
+      this.getKey(dependencyFilename)
+    );
+    const graphMayBeIncomplete = isEntrypointGraphIncomplete(cachedEntrypoint);
+    const hasKnownDependencyGraph = cachedEntrypoint
+      ? !graphMayBeIncomplete || hasRetainedSnapshot
+      : hasRetainedSnapshot;
+    const allowUnknownDependencyGraph = this.canTraverseUnknownGraph(
+      dependencyFilename,
+      graphTraversalToken
+    );
+    if (!hasKnownDependencyGraph && !allowUnknownDependencyGraph) {
+      // Record this independently of the mtime/hash fast path. The first
+      // verification after a cache clear may need to seed its fs hash, but
+      // reading the module's own bytes still cannot prove that its missing
+      // transitive graph is complete.
+      unknownDependencyGraphs.add(dependencyFilename);
+    }
 
     if (cachedMtime !== undefined) {
       let currentMtime: number;
@@ -518,7 +807,7 @@ export class TransformCacheCollection<
         this.invalidateForFile(dependencyFilename);
         this.forgetEntrypointDependencySnapshot(dependencyFilename);
         changedFiles.add(dependencyFilename);
-        dependencyChangeMemo.set(dependencyFilename, true);
+        dependencyChangeMemo.set(dependencyMemoKey, true);
         return true;
       }
 
@@ -536,37 +825,23 @@ export class TransformCacheCollection<
             changedFiles
           )
         ) {
-          dependencyChangeMemo.set(dependencyFilename, true);
+          dependencyChangeMemo.set(dependencyMemoKey, true);
           return true;
         }
 
-        if (!cachedEntrypoint) {
-          const hasKnownDependencyGraph =
-            this.entrypointDependencySnapshots.has(
-              this.getKey(dependencyFilename)
-            ) || this.hasCachedDependencies(dependencyFilename);
-          const fsHash = this.contentHashes.get(dependencyFilename)?.fs;
-          if (!hasKnownDependencyGraph || fsHash === undefined) {
-            // A content hash only proves that this file is unchanged. Without
-            // a retained graph, an evicted entrypoint may still hide a changed
-            // transitive dependency, so the state remains unknown. Report it
-            // as changed only once: a permanently unknown graph would
-            // otherwise invalidate and supersede the parent on every check.
-            // Later checks fall through to the content-hash verification below.
-            if (
-              fsHash === undefined ||
-              !this.unknownGraphReported.has(dependencyFilename)
-            ) {
-              this.unknownGraphReported.add(dependencyFilename);
-              cacheLogger(
-                'dependency graph for %s is unknown, conservatively report as changed',
-                dependencyFilename
-              );
-              dependencyChangeMemo.set(dependencyFilename, true);
-              return true;
-            }
-          }
+        const invalidateOnDependencyChange =
+          this.getInvalidateOnDependencyChange(
+            dependencyFilename,
+            cachedEntrypoint
+          );
+        const fsHash = this.contentHashes.get(dependencyFilename)?.fs;
+        const dependencyGraphIsUnknown =
+          !hasKnownDependencyGraph || fsHash === undefined;
+        if (dependencyGraphIsUnknown && !allowUnknownDependencyGraph) {
+          unknownDependencyGraphs.add(dependencyFilename);
+        }
 
+        if (!cachedEntrypoint) {
           // A missing entrypoint can be cache churn. Verify its own source,
           // then continue through the lightweight dependency snapshot taken
           // when the entrypoint was evicted.
@@ -578,38 +853,59 @@ export class TransformCacheCollection<
               changedFiles
             )
           ) {
-            dependencyChangeMemo.set(dependencyFilename, true);
+            dependencyChangeMemo.set(dependencyMemoKey, true);
             return true;
           }
         }
 
-        if (nestedDependencies.size === 0) {
-          dependencyChangeMemo.set(dependencyFilename, false);
-          return false;
-        }
+        if (nestedDependencies.size > 0) {
+          const nextVisitedFiles = new Set(visitedFiles);
+          nextVisitedFiles.add(dependencyFilename);
 
-        const nextVisitedFiles = new Set(visitedFiles);
-        nextVisitedFiles.add(dependencyFilename);
-
-        for (const [, nestedDependency] of nestedDependencies) {
-          if (
-            nestedDependency.resolved &&
-            this.didDependencyChange(
-              nestedDependency.resolved,
-              nextVisitedFiles,
-              changedFiles,
-              dependencyChangeMemo,
-              forceContentCheck
-            )
-          ) {
-            this.invalidateForFile(dependencyFilename);
-            changedFiles.add(dependencyFilename);
-            dependencyChangeMemo.set(dependencyFilename, true);
-            return true;
+          for (const [, nestedDependency] of nestedDependencies) {
+            if (
+              nestedDependency.resolved &&
+              this.didDependencyChange(
+                nestedDependency.resolved,
+                nextVisitedFiles,
+                changedFiles,
+                dependencyChangeMemo,
+                unknownDependencyGraphs,
+                forceContentCheck ||
+                  invalidateOnDependencyChange?.has(
+                    nestedDependency.resolved
+                  ) ||
+                  false,
+                graphTraversalToken
+              )
+            ) {
+              this.invalidateForFile(dependencyFilename);
+              changedFiles.add(dependencyFilename);
+              dependencyChangeMemo.set(dependencyMemoKey, true);
+              return true;
+            }
           }
         }
 
-        dependencyChangeMemo.set(dependencyFilename, false);
+        if (dependencyGraphIsUnknown) {
+          // Auxiliary export/barrel dependencies are useful edges, so inspect
+          // them above and invalidate their caches when they change. They are
+          // still only a partial graph, though. Without a complete entrypoint
+          // graph, an evicted or unfinished module may hide another changed
+          // transitive dependency. Remain fail-closed until a complete graph
+          // is restored; the supersede guard bounds a failure to converge.
+          cacheLogger(
+            'dependency graph for %s is unknown, conservatively report as changed',
+            dependencyFilename
+          );
+          dependencyChangeMemo.set(
+            dependencyMemoKey,
+            !allowUnknownDependencyGraph
+          );
+          return !allowUnknownDependencyGraph;
+        }
+
+        dependencyChangeMemo.set(dependencyMemoKey, false);
         return false;
       }
     }
@@ -626,22 +922,52 @@ export class TransformCacheCollection<
       this.invalidateForFile(dependencyFilename);
       this.forgetEntrypointDependencySnapshot(dependencyFilename);
       changedFiles.add(dependencyFilename);
-      dependencyChangeMemo.set(dependencyFilename, true);
+      dependencyChangeMemo.set(dependencyMemoKey, true);
       return true;
     }
 
-    const invalidated = this.invalidateIfChanged(
+    const invalidated = this.invalidateIfChangedInternal(
       dependencyFilename,
       dependencyContent,
       visitedFiles,
       'fs',
       changedFiles,
       dependencyChangeMemo,
-      forceContentCheck
+      forceContentCheck,
+      unknownDependencyGraphs,
+      graphTraversalToken
     );
 
-    dependencyChangeMemo.set(dependencyFilename, invalidated);
-    return invalidated;
+    const dependencyChanged =
+      invalidated || (!hasKnownDependencyGraph && !allowUnknownDependencyGraph);
+    if (!hasKnownDependencyGraph) {
+      cacheLogger(
+        'dependency graph for %s is unknown after content verification, conservatively report as changed',
+        dependencyFilename
+      );
+    }
+    dependencyChangeMemo.set(dependencyMemoKey, dependencyChanged);
+    return dependencyChanged;
+  }
+
+  private canTraverseUnknownGraph(
+    filename: string,
+    graphTraversalToken?: object
+  ): boolean {
+    if (!graphTraversalToken) {
+      return false;
+    }
+
+    const tokenState = graphTraversalTokenStates.get(graphTraversalToken);
+    if (
+      tokenState?.owner !== this ||
+      tokenState.version !== this.lifecycleVersion
+    ) {
+      return false;
+    }
+
+    const pending = this.pendingUnknownGraphs.get(filename);
+    return !pending || pending.recoveryToken === graphTraversalToken;
   }
 
   private didFileContentHashChange(
@@ -697,7 +1023,6 @@ export class TransformCacheCollection<
     }
 
     cache.set(cacheKey, nextDependencies);
-    this.unknownGraphReported.delete(key);
   }
 
   /**
@@ -780,11 +1105,15 @@ export class TransformCacheCollection<
     filename: string,
     entrypoint: TEntrypoint
   ): void {
-    if (entrypoint.isProcessing) {
-      // Mid-processing dependency maps are incomplete: take no snapshot, but
-      // keep one from an earlier eviction. A stale-but-complete graph still
-      // allows dependency checks; deleting it would leave the file in the
-      // unknown-graph state that forces conservative invalidation.
+    if (
+      entrypoint.isProcessing ||
+      entrypoint.transformed === false ||
+      entrypoint.hasTransformResult === false
+    ) {
+      // An unfinished entrypoint's dependency maps may be incomplete: take no
+      // snapshot, but keep one from an earlier completed generation. The
+      // previous complete graph still allows conservative dependency checks;
+      // deleting it would force repeated unknown-graph invalidation.
       return;
     }
 
@@ -801,8 +1130,10 @@ export class TransformCacheCollection<
     this.entrypointDependencySnapshots.set(this.getKey(filename), {
       dependencies: copy(entrypoint.dependencies),
       invalidationDependencies: copy(entrypoint.invalidationDependencies),
+      invalidateOnDependencyChange: new Set(
+        entrypoint.invalidateOnDependencyChange ?? []
+      ),
     });
-    this.unknownGraphReported.delete(filename);
   }
 
   private forgetEntrypointDependencySnapshot(filename: string): void {

@@ -233,9 +233,12 @@ const exportSpecifierCode = (specifier: RewrittenExportSpecifier): string => {
 function createAnalysisEntrypoint(
   services: Services,
   filename: string,
-  loadedCode?: string
+  loadedCode?: string,
+  graphTraversalToken?: object
 ): Entrypoint {
-  return Entrypoint.createRoot(services, filename, ['*'], loadedCode);
+  return Entrypoint.createRoot(services, filename, ['*'], loadedCode, {
+    graphTraversalToken,
+  });
 }
 
 function getUniqueSources(raw: RawBarrelManifest): string[] {
@@ -685,6 +688,7 @@ function* getWildcardExportDependencies(
     analysisServices,
     filename
   );
+  this.entrypoint.assertNotSuperseded();
   this.services.cache.add('exports', filename, exportNames);
 
   const wildcardReexports = collectOxcExportsAndImports(
@@ -699,7 +703,8 @@ function* getWildcardExportDependencies(
   const resolveEntrypoint = createAnalysisEntrypoint(
     analysisServices,
     filename,
-    loadedAndParsed.code
+    loadedAndParsed.code,
+    this.entrypoint.graphTraversalToken
   );
   const resolvedImports = yield* this.getNext(
     'resolveImports',
@@ -731,6 +736,7 @@ function* getWildcardExportDependencies(
     nested.forEach((item) => dependencies.add(item));
   }
 
+  this.entrypoint.assertNotSuperseded();
   this.services.cache.setCacheDependencies('exports', filename, dependencies);
 
   return [...dependencies];
@@ -741,7 +747,12 @@ function* getExportsForFile(
   services: Services,
   filename: string
 ): Generator<any, string[], any> {
-  const entrypoint = createAnalysisEntrypoint(services, filename);
+  const entrypoint = createAnalysisEntrypoint(
+    services,
+    filename,
+    undefined,
+    this.entrypoint.graphTraversalToken
+  );
   return yield* this.getNext('getExports', entrypoint, undefined, null);
 }
 
@@ -751,6 +762,7 @@ function* getOrBuildOxcBarrelManifest(
   filename: string,
   stack: Set<string> = new Set()
 ): Generator<any, BarrelManifestCacheEntry, any> {
+  this.entrypoint.assertNotSuperseded();
   const cached = this.services.cache.get('barrelManifests', filename);
   if (cached) {
     this.services.eventEmitter.single({
@@ -773,6 +785,7 @@ function* getOrBuildOxcBarrelManifest(
       kind: 'ineligible',
       reason: 'custom-evaluator',
     } as const;
+    this.entrypoint.assertNotSuperseded();
     this.services.cache.add('barrelManifests', filename, externalEntry);
     return externalEntry;
   }
@@ -782,6 +795,7 @@ function* getOrBuildOxcBarrelManifest(
       kind: 'ineligible',
       reason: 'ignored',
     } as const;
+    this.entrypoint.assertNotSuperseded();
     this.services.cache.add('barrelManifests', filename, ignoredEntry);
     return ignoredEntry;
   }
@@ -791,12 +805,14 @@ function* getOrBuildOxcBarrelManifest(
       kind: 'ineligible',
       reason: 'custom-evaluator',
     } as const;
+    this.entrypoint.assertNotSuperseded();
     this.services.cache.add('barrelManifests', filename, customEntry);
     return customEntry;
   }
 
   const analyzed = analyzeOxcBarrelFile(loadedAndParsed.code, filename);
   if (!isRawBarrelManifest(analyzed)) {
+    this.entrypoint.assertNotSuperseded();
     this.services.cache.add('barrelManifests', filename, analyzed);
     return analyzed;
   }
@@ -804,7 +820,8 @@ function* getOrBuildOxcBarrelManifest(
   const resolveEntrypoint = createAnalysisEntrypoint(
     analysisServices,
     filename,
-    loadedAndParsed.code
+    loadedAndParsed.code,
+    this.entrypoint.graphTraversalToken
   );
   const resolvedImports = yield* this.getNext(
     'resolveImports',
@@ -896,6 +913,7 @@ function* getOrBuildOxcBarrelManifest(
     }
   }
 
+  this.entrypoint.assertNotSuperseded();
   this.services.cache.add('barrelManifests', filename, manifest);
   this.services.cache.setCacheDependencies(
     'barrelManifests',

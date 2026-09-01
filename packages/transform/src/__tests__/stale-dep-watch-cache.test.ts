@@ -99,7 +99,13 @@ describe('stale dependency detection in watch mode', () => {
 
     const depServices = createServices(cache, depFile);
     const depCode = fs.readFileSync(depFile, 'utf-8');
-    Entrypoint.createRoot(depServices, depFile, ['val'], depCode);
+    const depEntrypoint = Entrypoint.createRoot(
+      depServices,
+      depFile,
+      ['val'],
+      depCode
+    );
+    depEntrypoint.setTransformResult({ code: depCode, metadata: null });
 
     const parentServices = createServices(cache, parentFile);
     const parentCode = fs.readFileSync(parentFile, 'utf-8');
@@ -114,6 +120,7 @@ describe('stale dependency detection in watch mode', () => {
       resolved: depFile,
       source: './dep',
     });
+    firstEntrypoint.setTransformResult({ code: parentCode, metadata: null });
 
     fs.writeFileSync(depFile, dedent`export const val = 'new';`);
 
@@ -147,7 +154,13 @@ describe('stale dependency detection in watch mode', () => {
 
     const depServices = createServices(cache, depFile);
     const depCode = fs.readFileSync(depFile, 'utf-8');
-    Entrypoint.createRoot(depServices, depFile, ['val'], depCode);
+    const depEntrypoint = Entrypoint.createRoot(
+      depServices,
+      depFile,
+      ['val'],
+      depCode
+    );
+    depEntrypoint.setTransformResult({ code: depCode, metadata: null });
 
     const parentServices = createServices(cache, parentFile);
     const parentCode = fs.readFileSync(parentFile, 'utf-8');
@@ -162,6 +175,7 @@ describe('stale dependency detection in watch mode', () => {
       resolved: depFile,
       source: './dep',
     });
+    firstEntrypoint.setTransformResult({ code: parentCode, metadata: null });
 
     const secondEntrypoint = Entrypoint.createRoot(
       parentServices,
