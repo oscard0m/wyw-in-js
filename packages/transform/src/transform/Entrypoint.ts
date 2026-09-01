@@ -19,6 +19,7 @@ import { BaseAction } from './actions/BaseAction';
 import { UnprocessedEntrypointError } from './actions/UnprocessedEntrypointError';
 import type { Services, ActionTypes, ActionQueueItem } from './types';
 import { stripQueryAndHash } from '../utils/parseRequest';
+import { recordPipelineEntrypoint } from '../debug/pipelineTelemetry';
 
 const EMPTY_FILE = '=== empty file ===';
 const DEFAULT_ACTION_CONTEXT = Symbol('defaultActionContext');
@@ -222,6 +223,13 @@ export class Entrypoint extends BaseEntrypoint {
         only,
         loadedCode,
         options
+      );
+
+      recordPipelineEntrypoint(
+        parent === null,
+        loadedCode !== undefined,
+        status,
+        entrypoint.only
       );
 
       if (status !== 'cached') {

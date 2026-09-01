@@ -23,6 +23,11 @@ import {
 } from '../static-plan/buildStaticPlan';
 import { rewriteOptimizedOxcBarrelImports } from './rewriteOxcBarrelImports';
 import { resolveStaticOxcPreevalValues } from './resolveStaticOxcValues';
+import {
+  beginPipelineShake,
+  finishPipelineShake,
+  recordPipelineLateNoMetadata,
+} from '../../debug/pipelineTelemetry';
 
 const EMPTY_FILE = '=== empty file ===';
 
@@ -212,6 +217,7 @@ const prepareOxcCodeImpl = (
     options.shortCircuitOnMissingMetadata !== false
   ) {
     log('[evaluator:end] no metadata');
+    recordPipelineLateNoMetadata(filename, only, 'preeval');
     const strippedCode = stripTypesAndJsxWithOxc(preevalCode, filename).code;
 
     return [
@@ -225,13 +231,35 @@ const prepareOxcCodeImpl = (
   log('[evaluator:start] using %s', loadedAndParsed.evaluator.name);
   log.extend('source')('%s', preevalCode);
 
-  const shaken = eventEmitter.perf('transform:evaluator', () =>
-    shakeOxcToESM(preevalCode, filename, {
-      importOverrides: pluginOptions.importOverrides,
-      onlyExports: only,
-      root,
-    })
+  const shakeToken = beginPipelineShake(
+    preevalCode,
+    only,
+    options.stripForEvalRuntime ? 'eval-runtime' : 'transform'
   );
+  let shaken: ReturnType<typeof shakeOxcToESM>;
+  if (!shakeToken) {
+    shaken = eventEmitter.perf('transform:evaluator', () =>
+      shakeOxcToESM(preevalCode, filename, {
+        importOverrides: pluginOptions.importOverrides,
+        onlyExports: only,
+        root,
+      })
+    );
+  } else {
+    try {
+      shaken = eventEmitter.perf('transform:evaluator', () =>
+        shakeOxcToESM(preevalCode, filename, {
+          importOverrides: pluginOptions.importOverrides,
+          onlyExports: only,
+          root,
+        })
+      );
+      finishPipelineShake(shakeToken, shaken.code, false);
+    } catch (error) {
+      finishPipelineShake(shakeToken, null, true);
+      throw error;
+    }
+  }
 
   log('[evaluator:end]');
 

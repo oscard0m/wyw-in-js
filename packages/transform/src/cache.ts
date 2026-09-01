@@ -2,6 +2,13 @@ import { createHash } from 'crypto';
 import fs from 'node:fs';
 import { logger } from '@wyw-in-js/shared';
 
+import {
+  getPipelineCodeSha256Hex,
+  primePipelineCodeSha256Hex,
+  recordPipelineCacheClear,
+  recordPipelineCacheRequest,
+  recordPipelineCacheSalt,
+} from './debug/pipelineTelemetry';
 import type { BarrelManifestCacheEntry } from './transform/barrelManifest.types';
 import type { Entrypoint } from './transform/Entrypoint';
 import type { IEvaluatedEntrypoint } from './transform/EvaluatedEntrypoint';
@@ -9,7 +16,12 @@ import { getFileIdx } from './utils/getFileIdx';
 import { stripQueryAndHash } from './utils/parseRequest';
 
 function hashContent(content: string) {
-  return createHash('sha256').update(content).digest('hex');
+  const cached = getPipelineCodeSha256Hex(content);
+  if (cached) return cached;
+
+  const sha256Hex = createHash('sha256').update(content).digest('hex');
+  primePipelineCodeSha256Hex(content, sha256Hex);
+  return sha256Hex;
 }
 
 function isMissingFileError(error: unknown): boolean {
@@ -90,12 +102,16 @@ export class TransformCacheCollection<
   }
 
   public setKeySalt(keySalt: string | null) {
-    if (this.keySalt === keySalt) return;
-
     const prevKeySalt = this.keySalt;
+    if (prevKeySalt === keySalt) {
+      recordPipelineCacheSalt(prevKeySalt, keySalt, 'unchanged');
+      return;
+    }
+
     this.keySalt = keySalt;
 
     if (prevKeySalt === null && keySalt) {
+      recordPipelineCacheSalt(prevKeySalt, keySalt, 'migrate');
       const migrate = <TValue>(cache: Map<string, TValue>) => {
         const entries = Array.from(cache.entries());
         cache.clear();
@@ -113,8 +129,21 @@ export class TransformCacheCollection<
       return;
     }
 
+    const clearReason = keySalt === null ? 'salt-disable' : 'salt-change';
+    recordPipelineCacheSalt(
+      prevKeySalt,
+      keySalt,
+      keySalt === null ? 'disable' : 'clear'
+    );
+    recordPipelineCacheClear(
+      'barrelManifests',
+      clearReason,
+      this.barrelManifests.size
+    );
     this.barrelManifests.clear();
+    recordPipelineCacheClear('entrypoints', clearReason, this.entrypoints.size);
     this.entrypoints.clear();
+    recordPipelineCacheClear('exports', clearReason, this.exports.size);
     this.exports.clear();
     this.entrypointDependencySnapshots.clear();
     this.clearCacheDependencies('all');
@@ -217,6 +246,7 @@ export class TransformCacheCollection<
     loggers[cacheName]('clear');
     const cache = this[cacheName] as Map<string, unknown>;
 
+    recordPipelineCacheClear(cacheName, 'explicit', cache.size);
     cache.clear();
     if (cacheName === 'entrypoints') {
       this.entrypointDependencySnapshots.clear();
@@ -236,6 +266,7 @@ export class TransformCacheCollection<
     const res = cache.get(this.getKey(key));
 
     loggers[cacheName]('get', key, res === undefined ? 'miss' : 'hit');
+    recordPipelineCacheRequest(cacheName, 'get', res !== undefined);
     return res;
   }
 
@@ -244,6 +275,7 @@ export class TransformCacheCollection<
     const res = cache.has(this.getKey(key));
 
     loggers[cacheName]('has', key, res);
+    recordPipelineCacheRequest(cacheName, 'has', res);
     return res;
   }
 
@@ -265,6 +297,7 @@ export class TransformCacheCollection<
     }
 
     cache.delete(cacheKey);
+    recordPipelineCacheClear(cacheName, 'invalidate', 1);
     this.clearCacheDependencies(cacheName, key);
   }
 

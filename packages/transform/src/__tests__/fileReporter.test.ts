@@ -3,7 +3,15 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { createFileReporter } from '../debug/fileReporter';
+import {
+  beginPipelineShake,
+  finishPipelineShake,
+  recordPipelineCacheRequest,
+  recordPipelineProcessors,
+  runWithPipelineTelemetry,
+} from '../debug/pipelineTelemetry';
 import { EventEmitter } from '../utils/EventEmitter';
+import { parseOxcCached } from '../utils/parseOxc';
 
 const delay = (intervalMs: number) =>
   new Promise<void>((resolve) => {
@@ -156,6 +164,190 @@ describe('createFileReporter', () => {
       );
       expect(events[0].filename).toContain('foo.ts');
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes one pipeline telemetry summary per transform root', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wyw-file-reporter-'));
+    const reporter = createFileReporter({ dir });
+
+    try {
+      await runWithPipelineTelemetry(
+        reporter.emitter,
+        () => ({ filename: join(dir, 'root.ts') }),
+        async () => {
+          recordPipelineCacheRequest('entrypoints', 'get', true);
+          recordPipelineProcessors('preeval', false, 1, 1, 0, 0, 0);
+          const code = 'export const value: number = 1;';
+          parseOxcCached(join(dir, 'root.ts'), code, 'module');
+          parseOxcCached(join(dir, 'root.ts'), code, 'module');
+          const shakeToken = beginPipelineShake(
+            'export const unused = 1;',
+            ['unused'],
+            'preval'
+          );
+          finishPipelineShake(shakeToken, 'export {};', false);
+        }
+      );
+
+      reporter.onDone(dir);
+
+      const target = join(dir, 'pipeline-telemetry.jsonl');
+      await waitFor(() => hasJsonlLines(target, 2));
+
+      const events = readJsonl(target);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual(
+        expect.objectContaining({
+          denominators: expect.any(Object),
+          schemaVersion: 1,
+          tupleEncoding: expect.objectContaining({
+            layouts: expect.objectContaining({
+              parseRevision: [
+                'revision',
+                'parserKeyIdOrString',
+                'bytes',
+                'requests',
+                'mask',
+                '...values',
+              ],
+            }),
+            masks: {
+              parseRevision: {
+                cacheHits: 2,
+                cacheMisses: 4,
+                errors: 8,
+                jsxFallbackAttempts: 32,
+                jsxFallbackRequests: 16,
+                kind: 1,
+              },
+              processor: {
+                definedProcessors: 1,
+                importCandidates: 2,
+                lookupAttempts: 4,
+                lookupHits: 8,
+                passes: 16,
+                reusedPlans: 32,
+                usages: 64,
+              },
+              shakeCall: { error: 1, generatedBytes: 2 },
+            },
+          }),
+          type: 'pipeline-telemetry-schema',
+        })
+      );
+      expect(events[1]).toEqual(
+        expect.objectContaining({
+          cache: [1, 1, 0, 0, 0, [0, 0, 0, 0, 0, []], [[1, 0, 1, 0, 1]], []],
+          root: expect.objectContaining({
+            filename: expect.stringContaining('root.ts'),
+            status: 'success',
+          }),
+          schemaVersion: 1,
+          type: 'pipeline-telemetry',
+        })
+      );
+      expect(events[1].parse).toEqual([
+        [2, 2, 0, 1, 1, 1, 62, 31, 0, 0, 0],
+        [[expect.any(String), 10, 31, 2, 6, 1, 1]],
+      ]);
+      expect(events[1].processors).toEqual([['preeval', 6, 1, 1]]);
+      expect(events[1].shakes).toEqual([
+        1,
+        1,
+        0,
+        10,
+        [
+          [
+            expect.any(String),
+            'preval',
+            ['unused'],
+            expect.any(String),
+            24,
+            2,
+            10,
+          ],
+        ],
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('flushes prior roots with an error root before onDone without duplicates', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wyw-file-reporter-'));
+    const reporter = createFileReporter({ dir });
+    const target = join(dir, 'pipeline-telemetry.jsonl');
+
+    try {
+      await runWithPipelineTelemetry(
+        reporter.emitter,
+        () => ({ filename: join(dir, 'success.ts') }),
+        async () => 1
+      );
+      await expect(
+        runWithPipelineTelemetry(
+          reporter.emitter,
+          () => ({ filename: join(dir, 'error.ts') }),
+          async () => {
+            throw new Error('transform failed');
+          }
+        )
+      ).rejects.toThrow('transform failed');
+
+      await waitFor(() => hasJsonlLines(target, 3));
+      expect(readJsonl(target).map((event) => event.root?.status)).toEqual([
+        undefined,
+        'success',
+        'error',
+      ]);
+
+      reporter.onDone(dir);
+      reporter.onDone(dir);
+      await delay(5);
+      expect(readJsonl(target)).toHaveLength(3);
+    } finally {
+      reporter.onDone(dir);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes every root exactly once across the telemetry chunk boundary', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wyw-file-reporter-'));
+    const reporter = createFileReporter({ dir });
+    const target = join(dir, 'pipeline-telemetry.jsonl');
+    const suffix = 'x'.repeat(130 * 1024);
+    const filenames = [`a-${suffix}`, `b-${suffix}`, `c-${suffix}`];
+
+    try {
+      for (const filename of filenames) {
+        // Preserve root emission order while exercising the shared writer.
+        // eslint-disable-next-line no-await-in-loop
+        await runWithPipelineTelemetry(
+          reporter.emitter,
+          () => ({ filename }),
+          async () => undefined
+        );
+      }
+
+      await waitFor(() => hasJsonlLines(target, 3));
+      expect(
+        readJsonl(target)
+          .slice(1)
+          .map((event) => event.root.filename)
+      ).toEqual(filenames.slice(0, 2));
+
+      reporter.onDone(dir);
+      reporter.onDone(dir);
+      await waitFor(() => hasJsonlLines(target, 4));
+      expect(
+        readJsonl(target)
+          .slice(1)
+          .map((event) => event.root.filename)
+      ).toEqual(filenames);
+    } finally {
+      reporter.onDone(dir);
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -360,11 +552,73 @@ describe('createFileReporter', () => {
     }
   });
 
-  it('returns a dummy reporter when no dir is provided', () => {
+  it('drops pipeline telemetry safely when its stream fails to open', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wyw-file-reporter-'));
+    mkdirSync(join(dir, 'pipeline-telemetry.jsonl'));
+
+    const warnings: unknown[][] = [];
+    // eslint-disable-next-line no-console
+    const originalWarn = console.warn;
+    // eslint-disable-next-line no-console
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+
+    try {
+      const reporter = createFileReporter({ dir });
+      await waitFor(() => warnings.length > 0);
+
+      await expect(
+        runWithPipelineTelemetry(
+          reporter.emitter,
+          () => ({ filename: join(dir, 'root.ts') }),
+          async () => 42
+        )
+      ).resolves.toBe(42);
+      reporter.emitter.single({
+        filename: join(dir, 'root.ts'),
+        phase: 'export',
+        reason: 'unsupported-expression',
+        status: 'rejected',
+        type: 'staticResolve',
+      });
+
+      expect(() => reporter.onDone(dir)).not.toThrow();
+      expect(() => reporter.onDone(dir)).not.toThrow();
+      const target = join(dir, 'static-resolve.jsonl');
+      await waitFor(() => hasJsonlLines(target, 1));
+
+      expect(readJsonl(target)).toHaveLength(1);
+      expect(warnings).toHaveLength(1);
+      expect(String(warnings[0][0])).toContain('pipeline-telemetry.jsonl');
+    } finally {
+      // eslint-disable-next-line no-console
+      console.warn = originalWarn;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns a dummy reporter without evaluating telemetry metadata', async () => {
     const reporter = createFileReporter(false);
+    let metadataCalls = 0;
+
     expect(() =>
       reporter.emitter.single({ type: 'staticResolve' })
     ).not.toThrow();
+    await expect(
+      runWithPipelineTelemetry(
+        reporter.emitter,
+        () => {
+          metadataCalls += 1;
+          return { filename: '/project/root.ts' };
+        },
+        async () => {
+          recordPipelineCacheRequest('entrypoints', 'get', true);
+          return 42;
+        }
+      )
+    ).resolves.toBe(42);
+    expect(metadataCalls).toBe(0);
     expect(() => reporter.onDone('/')).not.toThrow();
   });
 });

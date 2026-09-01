@@ -2,6 +2,10 @@ import { isAborted } from '../actions/AbortError';
 import type { IWorkflowAction, SyncScenarioForAction } from '../types';
 import { collectTransformDiagnostics } from '../../utils/TransformDiagnostics';
 import { toTransformResultMetadata } from '../../utils/TransformMetadata';
+import {
+  recordPipelineDisposableRoot,
+  recordPipelineLateNoMetadata,
+} from '../../debug/pipelineTelemetry';
 
 const isLoadedEntrypointWithoutArtifacts = (
   entrypoint: IWorkflowAction['entrypoint']
@@ -77,6 +81,7 @@ export function* workflow(
     if (isLoadedEntrypointWithoutArtifacts(entrypoint)) {
       // A root bundler pass for a plain dependency must not pin eval/cache state.
       // If another WyW file needs this module, it will be prepared on demand.
+      recordPipelineDisposableRoot(entrypoint.name, 'preeval');
       cache.delete('entrypoints', entrypoint.name);
     }
 
@@ -124,7 +129,9 @@ export function* workflow(
     entrypoint.assertNotSuperseded();
 
     if (!collectStageResult.metadata) {
+      recordPipelineLateNoMetadata(entrypoint.name, entrypoint.only, 'collect');
       if (isLoadedEntrypointWithoutArtifacts(entrypoint)) {
+        recordPipelineDisposableRoot(entrypoint.name, 'collect');
         cache.delete('entrypoints', entrypoint.name);
       }
 

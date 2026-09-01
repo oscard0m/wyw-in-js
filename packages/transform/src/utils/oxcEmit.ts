@@ -18,6 +18,8 @@ import type {
   VariableDeclarator,
 } from 'oxc-parser';
 
+import { recordPipelineUncachedParse } from '../debug/pipelineTelemetry';
+
 type Replacement = {
   end: number;
   start: number;
@@ -244,15 +246,23 @@ const applyReplacements = (
 };
 
 const parseJsModule = (code: string, filename: string): Program => {
-  const parsed = parseSync(filename, code, {
-    astType: 'js',
-    range: true,
-    sourceType: 'module',
-  });
+  let parsed: ReturnType<typeof parseSync>;
+  try {
+    parsed = parseSync(filename, code, {
+      astType: 'js',
+      range: true,
+      sourceType: 'module',
+    });
+  } catch (error) {
+    recordPipelineUncachedParse(filename, code, 'module', 'js', true);
+    throw error;
+  }
   const fatalError = parsed.errors.find((error) => error.severity === 'Error');
   if (fatalError) {
+    recordPipelineUncachedParse(filename, code, 'module', 'js', true);
     throw new Error(fatalError.message);
   }
+  recordPipelineUncachedParse(filename, code, 'module', 'js', false);
 
   return parsed.program as Program;
 };

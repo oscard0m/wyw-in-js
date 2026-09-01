@@ -45,7 +45,7 @@ import {
   collectProcessorUsages,
   collectUsageExpressionSpans,
 } from './processorUsages';
-import { removeUnusedAfterReplacement } from './cleanupRemovals';
+import { removeUnusedAfterReplacement } from './cleanup-after-replacement';
 import { insertAddedImports, parseOxc } from './shared';
 import type {
   ApplyOxcProcessorsResult,
@@ -57,6 +57,10 @@ import type {
   SameFileProcessorObject,
   StaticPlanFacts,
 } from './types';
+import {
+  isPipelineTelemetryActive,
+  recordPipelineProcessors,
+} from '../../debug/pipelineTelemetry';
 
 const EMPTY_STATIC_PLAN_FACTS: StaticPlanFacts = {
   importedNeeds: [],
@@ -131,6 +135,14 @@ export const applyOxcProcessors = (
   const eventEmitter = options.eventEmitter ?? EventEmitter.dummy;
   const perfPrefix = options.perfPrefix ?? 'transform:preeval:processTemplate';
   const perfLabel = (suffix: string): string => `${perfPrefix}:${suffix}`;
+  const pipelineTelemetryEnabled = isPipelineTelemetryActive();
+  const pipelineTelemetryPhase =
+    pipelineTelemetryEnabled && perfPrefix.includes(':collect')
+      ? 'collect'
+      : 'preeval';
+  let pipelineImportCandidates = 0;
+  let pipelineLookupAttempts = 0;
+  let pipelineLookupHits = 0;
   const collectStaticExpressionValues =
     shouldCollectStaticExpressionValues(options);
   const workingCode = code;
@@ -167,12 +179,18 @@ export const applyOxcProcessors = (
       const imports = eventEmitter.perf(perfLabel('imports:analysis'), () =>
         collectOxcProcessorImportsFromProgram(program, workingCode)
       );
+      if (pipelineTelemetryEnabled) {
+        pipelineImportCandidates = imports.length;
+      }
 
       eventEmitter.perf(perfLabel('imports:lookup'), () => {
         imports.forEach((item) => {
           const localName = item.local.name ?? item.local.code;
           if (item.imported === 'side-effect' || !localName) {
             return;
+          }
+          if (pipelineTelemetryEnabled) {
+            pipelineLookupAttempts += 1;
           }
 
           const [processor, tagSource, manifest] = getProcessorForImport(
@@ -185,6 +203,9 @@ export const applyOxcProcessors = (
           );
 
           if (processor) {
+            if (pipelineTelemetryEnabled) {
+              pipelineLookupHits += 1;
+            }
             definedProcessors.set(localName, [
               processor,
               tagSource,
@@ -207,6 +228,17 @@ export const applyOxcProcessors = (
   }
 
   if (!reusablePlan && definedProcessors.size === 0) {
+    if (pipelineTelemetryEnabled) {
+      recordPipelineProcessors(
+        pipelineTelemetryPhase,
+        false,
+        pipelineImportCandidates,
+        pipelineLookupAttempts,
+        pipelineLookupHits,
+        0,
+        0
+      );
+    }
     return {
       code: buildUnprocessedCode(),
       processorManagedExpressionSpans: [],
@@ -224,6 +256,17 @@ export const applyOxcProcessors = (
     eventEmitter.perf(perfLabel('usages'), () =>
       collectProcessorUsages(program, definedProcessors)
     );
+  if (pipelineTelemetryEnabled) {
+    recordPipelineProcessors(
+      pipelineTelemetryPhase,
+      Boolean(reusablePlan),
+      pipelineImportCandidates,
+      pipelineLookupAttempts,
+      pipelineLookupHits,
+      definedProcessors.size,
+      processorUsages.length
+    );
+  }
   if (processorUsages.length === 0) {
     return {
       code: buildUnprocessedCode(),

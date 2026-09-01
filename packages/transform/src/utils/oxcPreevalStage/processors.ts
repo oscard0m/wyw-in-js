@@ -6,6 +6,10 @@ import { applyOxcProcessors } from '../applyOxcProcessors';
 import type { ApplyOxcProcessorsResult } from '../applyOxcProcessors/types';
 import { createDangerousCodePlanWithOxc } from '../dangerousCodeRemoval';
 import type { OxcPreevalOptions } from './types';
+import {
+  beginPipelineDangerousCode,
+  finishPipelineDangerousCode,
+} from '../../debug/pipelineTelemetry';
 
 type PreevalProcessorCollection = {
   dependencyNames: string[];
@@ -24,13 +28,42 @@ export const collectPreevalProcessors = (
     'dangerousCodeRemover',
     filename
   )
-    ? (processorSpans: Array<{ end: number; start: number }>) =>
-        eventEmitter.perf('transform:preeval:removeDangerousCode', () =>
-          createDangerousCodePlanWithOxc(code, filename, options.codeRemover, {
-            ignoredSpans: processorSpans,
-            preserveImportMetaEnv: true,
-          })
-        )
+    ? (processorSpans: Array<{ end: number; start: number }>) => {
+        const telemetryToken = beginPipelineDangerousCode(filename);
+        if (!telemetryToken) {
+          return eventEmitter.perf(
+            'transform:preeval:removeDangerousCode',
+            () =>
+              createDangerousCodePlanWithOxc(
+                code,
+                filename,
+                options.codeRemover,
+                {
+                  ignoredSpans: processorSpans,
+                  preserveImportMetaEnv: true,
+                }
+              )
+          );
+        }
+
+        try {
+          return eventEmitter.perf(
+            'transform:preeval:removeDangerousCode',
+            () =>
+              createDangerousCodePlanWithOxc(
+                code,
+                filename,
+                options.codeRemover,
+                {
+                  ignoredSpans: processorSpans,
+                  preserveImportMetaEnv: true,
+                }
+              )
+          );
+        } finally {
+          finishPipelineDangerousCode(telemetryToken);
+        }
+      }
     : undefined;
   const processed = eventEmitter.perf('transform:preeval:processTemplate', () =>
     applyOxcProcessors(
