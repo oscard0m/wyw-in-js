@@ -23,6 +23,29 @@ describe('getEvalCacheKey', () => {
     );
   });
 
+  it('changes the key when the transform root changes', () => {
+    const pluginOptions = loadWywOptions({ configFile: false });
+    const asyncResolve = async () => null;
+
+    expect(
+      getEvalCacheKey(
+        pluginOptions,
+        'webpack:compiler-a',
+        asyncResolve,
+        undefined,
+        '/project/server'
+      )
+    ).not.toBe(
+      getEvalCacheKey(
+        pluginOptions,
+        'webpack:compiler-a',
+        asyncResolve,
+        undefined,
+        '/project/client'
+      )
+    );
+  });
+
   it('canonicalizes globals before hashing', () => {
     const asyncResolve = async () => null;
     const firstOptions = loadWywOptions({

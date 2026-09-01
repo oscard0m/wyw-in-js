@@ -13,7 +13,6 @@ jest.mock('@wyw-in-js/transform', () => ({
   __esModule: true,
   TransformCacheCollection: class TransformCacheCollection {},
   transform: (...args: unknown[]) => transformMock(...args),
-  disposeEvalBroker: jest.fn(),
 }));
 
 describe('turbopack-loader', () => {
@@ -266,5 +265,222 @@ describe('turbopack-loader', () => {
     });
 
     await expect(runLoader).rejects.toBe(resolutionError);
+  });
+
+  it('keeps concurrent same-path resolvers isolated across cleanup order', async () => {
+    const { default: turbopackLoader } = await import('../index');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wyw-turbo-'));
+    const resourcePath = path.join(tmpDir, 'entry.tsx');
+    fs.writeFileSync(resourcePath, 'export const x = 1;\n');
+
+    type Resolver = (
+      what: string,
+      importer: string,
+      stack: string[]
+    ) => Promise<string>;
+    const resolvers: Resolver[] = [];
+    const releases: Array<() => void> = [];
+
+    transformMock.mockImplementation(
+      async (_services, code, resolver: Resolver) => {
+        resolvers.push(resolver);
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+        return { code, sourceMap: null, cssText: '', dependencies: [] };
+      }
+    );
+
+    const runLoader = (target: 'server' | 'client') =>
+      new Promise<void>((resolve, reject) => {
+        turbopackLoader.call(
+          {
+            addDependency: jest.fn(),
+            async: jest.fn(),
+            callback: (err: Error | null) => {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve();
+            },
+            emitWarning: jest.fn(),
+            getOptions: () => ({}),
+            getResolve: () => async (_context: string, request: string) =>
+              path.join(tmpDir, target, request),
+            resourcePath,
+          } as any,
+          fs.readFileSync(resourcePath, 'utf8'),
+          null
+        );
+      });
+
+    const serverLoader = runLoader('server');
+    const clientLoader = runLoader('client');
+
+    expect(resolvers).toHaveLength(2);
+    await expect(
+      resolvers[0]('theme', resourcePath, [resourcePath])
+    ).resolves.toBe(path.join(tmpDir, 'server', 'theme'));
+    await expect(
+      resolvers[1]('theme', resourcePath, [resourcePath])
+    ).resolves.toBe(path.join(tmpDir, 'client', 'theme'));
+
+    releases[1]();
+    await clientLoader;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+    await expect(
+      resolvers[0]('theme', resourcePath, [resourcePath])
+    ).resolves.toBe(path.join(tmpDir, 'server', 'theme'));
+
+    releases[0]();
+    await serverLoader;
+  });
+
+  it('isolates unkeyed invocations instead of assuming process-wide resolver semantics', async () => {
+    const { default: turbopackLoader } = await import('../index');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wyw-turbo-'));
+    const resourcePath = path.join(tmpDir, 'entry.tsx');
+    fs.writeFileSync(resourcePath, 'export const x = 1;\n');
+
+    const services: Array<{
+      asyncResolveKey: string;
+      cache: unknown;
+      evalBrokerScope: unknown;
+    }> = [];
+    const releases: Array<() => void> = [];
+
+    transformMock.mockImplementation(async (transformServices, code) => {
+      services.push(transformServices);
+      await new Promise<void>((resolve) => {
+        releases.push(resolve);
+      });
+      return { code, sourceMap: null, cssText: '', dependencies: [] };
+    });
+
+    const runLoader = () =>
+      new Promise<void>((resolve, reject) => {
+        turbopackLoader.call(
+          {
+            addDependency: jest.fn(),
+            async: jest.fn(),
+            callback: (err: Error | null) => {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve();
+            },
+            emitWarning: jest.fn(),
+            getOptions: () => ({}),
+            getResolve: () => async () => path.join(tmpDir, 'dep.ts'),
+            resourcePath,
+          } as any,
+          fs.readFileSync(resourcePath, 'utf8'),
+          null
+        );
+      });
+
+    const first = runLoader();
+    const second = runLoader();
+
+    expect(services).toHaveLength(2);
+    expect(services[0].asyncResolveKey).not.toBe(services[1].asyncResolveKey);
+    expect(services[0].cache).not.toBe(services[1].cache);
+    expect(services[0].evalBrokerScope).toBe(services[1].evalBrokerScope);
+
+    releases.forEach((release) => release());
+    await Promise.all([first, second]);
+  });
+
+  it('reuses cache keys only for an explicit resolver-semantics scope', async () => {
+    const { default: turbopackLoader } = await import('../index');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wyw-turbo-'));
+    const resourcePath = path.join(tmpDir, 'entry.tsx');
+    fs.writeFileSync(resourcePath, 'export const x = 1;\n');
+
+    type Resolver = (
+      what: string,
+      importer: string,
+      stack: string[]
+    ) => Promise<string>;
+    type Services = {
+      asyncResolveKey: string;
+      cache: unknown;
+      evalBrokerScope: unknown;
+    };
+    const calls: Array<{
+      resolver: Resolver;
+      services: Services;
+    }> = [];
+    const releases: Array<() => void> = [];
+
+    transformMock.mockImplementation(
+      async (services: Services, code, resolver: Resolver) => {
+        calls.push({ resolver, services });
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+        return { code, sourceMap: null, cssText: '', dependencies: [] };
+      }
+    );
+
+    const runLoader = (resolverScopeKey: string, aliasTarget: string) =>
+      new Promise<void>((resolve, reject) => {
+        turbopackLoader.call(
+          {
+            addDependency: jest.fn(),
+            async: jest.fn(),
+            callback: (err: Error | null) => {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve();
+            },
+            emitWarning: jest.fn(),
+            getOptions: () => ({ resolverScopeKey }),
+            getResolve: () => async () => aliasTarget,
+            resourcePath,
+          } as any,
+          fs.readFileSync(resourcePath, 'utf8'),
+          null
+        );
+      });
+
+    const server = runLoader('server-aliases-test', '/aliases/server.ts');
+    expect(await calls[0].resolver('theme', resourcePath, [resourcePath])).toBe(
+      '/aliases/server.ts'
+    );
+    releases[0]();
+    await server;
+
+    const client = runLoader('client-aliases-test', '/aliases/client.ts');
+    expect(await calls[1].resolver('theme', resourcePath, [resourcePath])).toBe(
+      '/aliases/client.ts'
+    );
+    expect(calls[1].services.asyncResolveKey).not.toBe(
+      calls[0].services.asyncResolveKey
+    );
+    expect(calls[1].services.cache).not.toBe(calls[0].services.cache);
+    expect(calls[1].services.evalBrokerScope).toBe(
+      calls[0].services.evalBrokerScope
+    );
+    releases[1]();
+    await client;
+
+    const nextServer = runLoader('server-aliases-test', '/aliases/server.ts');
+    expect(calls[2].services.asyncResolveKey).toBe(
+      calls[0].services.asyncResolveKey
+    );
+    expect(calls[2].services.cache).toBe(calls[0].services.cache);
+    releases[2]();
+    await nextServer;
   });
 });

@@ -28,8 +28,9 @@ const canonicalizeForHash = (value: unknown): unknown => {
 export const getStableInitPayloadHash = (
   payload: EvalRunnerInitPayload
 ): string => {
-  const { entrypoint, ...stable } = payload;
+  const { entrypoint, sessionId, ...stable } = payload;
   void entrypoint;
+  void sessionId;
 
   return createHash('sha256')
     .update(JSON.stringify(canonicalizeForHash(stable)))

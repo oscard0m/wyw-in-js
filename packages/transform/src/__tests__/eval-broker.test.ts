@@ -18,7 +18,9 @@ import { shaker } from '../shaker';
 import { withDefaultServices } from '../transform/helpers/withDefaultServices';
 import { Entrypoint } from '../transform/Entrypoint';
 import {
+  disposeEvalBroker,
   EvalBroker,
+  getEvalBroker,
   stripEntrypointGlobalsFromRunnerContext,
 } from '../eval/broker';
 import { prepareModuleOnDemand } from '../eval/prepareModuleOnDemand';
@@ -145,6 +147,685 @@ describe('EvalBroker', () => {
       __dirname: '/tmp/example',
       __filename: entry,
     });
+  });
+
+  it('reuses one runner process while isolating resolver semantic sessions', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const serverTheme = join(root, 'server-theme.js');
+    const clientTheme = join(root, 'client-theme.js');
+    const source = [
+      "import { value } from 'theme';",
+      'export const __wywPreval = {',
+      '  value: () => value,',
+      '};',
+    ].join('\n');
+    writeFileSync(entry, source);
+    writeFileSync(
+      serverTheme,
+      [
+        "globalThis.__wywResolverSessionLeak = 'server';",
+        "sessionState.value = 'server';",
+        "export const value = 'server';",
+      ].join('\n')
+    );
+    writeFileSync(
+      clientTheme,
+      "export const value = globalThis.__wywResolverSessionLeak ?? sessionState.value ?? 'client';"
+    );
+
+    const brokerScope = {};
+    const serverResolve = jest.fn(async (what: string) =>
+      what === 'theme' ? serverTheme : null
+    );
+    const clientResolve = jest.fn(async (what: string) =>
+      what === 'theme' ? clientTheme : null
+    );
+    const serverServices = createServices(root, entry, {
+      eval: { globals: { sessionState: {} } },
+    });
+    const clientServices = createServices(root, entry, {
+      eval: { globals: { sessionState: {} } },
+    });
+    serverServices.asyncResolve = serverResolve;
+    serverServices.evalBrokerScope = brokerScope;
+    serverServices.evalCacheKey = 'server-resolver-semantics';
+    clientServices.asyncResolve = clientResolve;
+    clientServices.evalBrokerScope = brokerScope;
+    clientServices.evalCacheKey = 'client-resolver-semantics';
+
+    const broker = getEvalBroker(
+      serverServices,
+      serverResolve,
+      serverServices.evalCacheKey
+    );
+    expect(
+      getEvalBroker(clientServices, clientResolve, clientServices.evalCacheKey)
+    ).toBe(broker);
+    const privateBroker = broker as unknown as {
+      createRunnerProcess: (reason: string) => unknown;
+      currentServices: ReturnType<typeof createServices>;
+    };
+    expect(privateBroker.currentServices).not.toBe(serverServices);
+    expect(privateBroker.currentServices.asyncResolve).toBeUndefined();
+    expect(privateBroker.currentServices.cache).not.toBe(serverServices.cache);
+    const spawnSpy = jest.spyOn(privateBroker, 'createRunnerProcess');
+
+    try {
+      const serverEntrypoint = Entrypoint.createRoot(
+        serverServices,
+        entry,
+        ['__wywPreval'],
+        source
+      );
+      const clientEntrypoint = Entrypoint.createRoot(
+        clientServices,
+        entry,
+        ['__wywPreval'],
+        source
+      );
+
+      const serverResult = await broker.evaluate(
+        serverEntrypoint,
+        serverServices
+      );
+      const clientResult = await broker.evaluate(
+        clientEntrypoint,
+        clientServices
+      );
+
+      expect(serverResult.values?.get('value')).toBe('server');
+      expect(clientResult.values?.get('value')).toBe('client');
+      expect(privateBroker.currentServices).not.toBe(clientServices);
+      expect(privateBroker.currentServices.asyncResolve).toBeUndefined();
+      expect(privateBroker.currentServices.cache).not.toBe(
+        clientServices.cache
+      );
+      expect(serverResolve).toHaveBeenCalledWith(
+        'theme',
+        entry,
+        expect.any(Array)
+      );
+      expect(clientResolve).toHaveBeenCalledWith(
+        'theme',
+        entry,
+        expect.any(Array)
+      );
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      disposeEvalBroker(brokerScope);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not deliver stale load results to a restarted runner', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const virtualTheme = join(root, 'virtual-theme.js');
+    const source = [
+      "import { value } from 'theme';",
+      'export const __wywPreval = {',
+      '  value: () => value,',
+      '};',
+    ].join('\n');
+    writeFileSync(entry, source);
+
+    const deferred = () => {
+      let resolvePromise!: () => void;
+      const promise = new Promise<void>((complete) => {
+        resolvePromise = complete;
+      });
+      return { promise, resolve: resolvePromise };
+    };
+    const aGate = deferred();
+    const bGate = deferred();
+    const aStarted = deferred();
+    const bStarted = deferred();
+    const brokerScope = {};
+
+    const createSession = (
+      key: string,
+      value: string,
+      gate: ReturnType<typeof deferred>,
+      started: ReturnType<typeof deferred>
+    ) => {
+      const services = createServices(root, entry, {
+        eval: {
+          customLoader: async (id) => {
+            if (id !== virtualTheme) return undefined;
+            started.resolve();
+            await gate.promise;
+            return {
+              code: `export const value = ${JSON.stringify(value)};`,
+            };
+          },
+        },
+      });
+      services.evalBrokerScope = brokerScope;
+      services.evalCacheKey = key;
+      services.asyncResolve = async (what) =>
+        what === 'theme' ? virtualTheme : null;
+      return services;
+    };
+
+    const aServices = createSession('session-a', 'A', aGate, aStarted);
+    const bServices = createSession('session-b', 'B', bGate, bStarted);
+    const broker = getEvalBroker(
+      aServices,
+      aServices.asyncResolve!,
+      aServices.evalCacheKey!
+    );
+    let bEval: ReturnType<typeof broker.evaluate> | undefined;
+
+    try {
+      const aEntrypoint = Entrypoint.createRoot(
+        aServices,
+        entry,
+        ['__wywPreval'],
+        source
+      );
+      const aEval = broker.evaluate(aEntrypoint, aServices);
+      await aStarted.promise;
+
+      const runner = getPrivateBroker(broker).runner as {
+        kill: () => boolean;
+        once: (event: 'exit', listener: () => void) => void;
+      };
+      const runnerExited = new Promise<void>((resolveExit) => {
+        runner.once('exit', resolveExit);
+      });
+      runner.kill();
+      await runnerExited;
+      await expect(aEval).rejects.toThrow(/Eval runner exited/);
+
+      const bEntrypoint = Entrypoint.createRoot(
+        bServices,
+        entry,
+        ['__wywPreval'],
+        source
+      );
+      bEval = broker.evaluate(bEntrypoint, bServices);
+      await bStarted.promise;
+
+      aGate.resolve();
+      const stillPending = Symbol('still-pending');
+      const earlyResult = await Promise.race([
+        bEval.then((result) => result.values?.get('value')),
+        new Promise<symbol>((resolveTimeout) => {
+          setTimeout(() => resolveTimeout(stillPending), 100);
+        }),
+      ]);
+      expect(earlyResult).toBe(stillPending);
+
+      bGate.resolve();
+      expect((await bEval).values?.get('value')).toBe('B');
+    } finally {
+      aGate.resolve();
+      bGate.resolve();
+      await bEval?.catch(() => undefined);
+      disposeEvalBroker(brokerScope);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('restarts a semantic session after an eval fails with a load in flight', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const slowModule = join(root, 'slow.js');
+    const failingModule = join(root, 'fail.js');
+    const source = [
+      "import { value as slow } from 'slow';",
+      "import { value as recovered } from 'fail';",
+      'export const __wywPreval = {',
+      '  value: () => slow + recovered,',
+      '};',
+    ].join('\n');
+    writeFileSync(entry, source);
+
+    const deferred = () => {
+      let resolvePromise!: () => void;
+      const promise = new Promise<void>((complete) => {
+        resolvePromise = complete;
+      });
+      return { promise, resolve: resolvePromise };
+    };
+    const firstSlowGate = deferred();
+    const secondSlowGate = deferred();
+    const firstSlowStarted = deferred();
+    const secondSlowStarted = deferred();
+    let slowCalls = 0;
+    let failCalls = 0;
+
+    const services = createServices(root, entry, {
+      eval: {
+        customLoader: async (id) => {
+          if (id === slowModule) {
+            slowCalls += 1;
+            const call = slowCalls;
+            if (call === 1) {
+              firstSlowStarted.resolve();
+              await firstSlowGate.promise;
+            } else {
+              secondSlowStarted.resolve();
+              await secondSlowGate.promise;
+            }
+            return { code: `export const value = 'slow-${call}';` };
+          }
+
+          if (id === failingModule) {
+            failCalls += 1;
+            if (failCalls === 1) {
+              await firstSlowStarted.promise;
+              throw new Error('one-shot load failure');
+            }
+            return { code: "export const value = '-ok';" };
+          }
+
+          return undefined;
+        },
+      },
+    });
+    services.evalCacheKey = 'same-semantic-session';
+    const asyncResolve = async (what: string) => {
+      if (what === 'slow') return slowModule;
+      if (what === 'fail') return failingModule;
+      return null;
+    };
+    services.asyncResolve = asyncResolve;
+    const broker = new EvalBroker(services, asyncResolve);
+    const createEntrypoint = () =>
+      Entrypoint.createRoot(services, entry, ['__wywPreval'], source);
+    let retry: ReturnType<typeof broker.evaluate> | undefined;
+
+    try {
+      await expect(
+        broker.evaluate(createEntrypoint(), services)
+      ).rejects.toThrow('one-shot load failure');
+      expect(slowCalls).toBe(1);
+      expect(failCalls).toBe(1);
+
+      retry = broker.evaluate(createEntrypoint(), services);
+      retry.catch(() => undefined);
+      const retryStarted = await Promise.race([
+        secondSlowStarted.promise.then(() => true),
+        new Promise<false>((resolveTimeout) => {
+          setTimeout(() => resolveTimeout(false), 500);
+        }),
+      ]);
+      expect(retryStarted).toBe(true);
+      expect(slowCalls).toBe(2);
+
+      firstSlowGate.resolve();
+      const stillPending = Symbol('still-pending');
+      const earlyResult = await Promise.race([
+        retry.then((result) => result.values?.get('value')),
+        new Promise<symbol>((resolveTimeout) => {
+          setTimeout(() => resolveTimeout(stillPending), 100);
+        }),
+      ]);
+      expect(earlyResult).toBe(stillPending);
+
+      secondSlowGate.resolve();
+      expect((await retry).values?.get('value')).toBe('slow-2-ok');
+      expect(failCalls).toBe(2);
+    } finally {
+      firstSlowGate.resolve();
+      secondSlowGate.resolve();
+
+      const runner = getPrivateBroker(broker).runner as {
+        exitCode: number | null;
+        kill: () => boolean;
+        once: (event: 'exit', listener: () => void) => void;
+        signalCode: string | null;
+      } | null;
+      if (runner && runner.exitCode === null && runner.signalCode === null) {
+        const runnerExited = new Promise<void>((resolveExit) => {
+          runner.once('exit', resolveExit);
+        });
+        runner.kill();
+        await runnerExited;
+      }
+      await retry?.catch(() => undefined);
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not carry a delayed dynamic import into the next semantic session', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const firstEntry = join(root, 'first.js');
+    const secondEntry = join(root, 'second.js');
+    const firstSlowModule = join(root, 'first-slow.js');
+    const secondSlowModule = join(root, 'second-slow.js');
+    const firstSource = [
+      'export const __wywPreval = {',
+      '  value: () => {',
+      "    void import('slow');",
+      "    return 'first';",
+      '  },',
+      '};',
+    ].join('\n');
+    const secondSource = [
+      "import { value } from 'slow';",
+      'export const __wywPreval = { value: () => value };',
+    ].join('\n');
+    writeFileSync(firstEntry, firstSource);
+    writeFileSync(secondEntry, secondSource);
+    writeFileSync(firstSlowModule, "export const value = 'old';");
+    writeFileSync(secondSlowModule, "export const value = 'new';");
+
+    const deferred = () => {
+      let resolvePromise!: () => void;
+      const promise = new Promise<void>((complete) => {
+        resolvePromise = complete;
+      });
+      return { promise, resolve: resolvePromise };
+    };
+    const firstGate = deferred();
+    const secondGate = deferred();
+    const firstStarted = deferred();
+    const secondStarted = deferred();
+    let firstLoads = 0;
+    let secondLoads = 0;
+
+    const firstServices = createServices(root, firstEntry, {
+      eval: {
+        customLoader: async (id) => {
+          if (id !== firstSlowModule) return undefined;
+          firstLoads += 1;
+          firstStarted.resolve();
+          await firstGate.promise;
+          return { code: "export const value = 'old';" };
+        },
+      },
+    });
+    firstServices.evalCacheKey = 'first-semantics';
+    firstServices.asyncResolve = async (what) =>
+      what === 'slow' ? firstSlowModule : null;
+
+    const secondServices = createServices(root, secondEntry, {
+      eval: {
+        customLoader: async (id) => {
+          if (id !== secondSlowModule) return undefined;
+          secondLoads += 1;
+          secondStarted.resolve();
+          await secondGate.promise;
+          return { code: "export const value = 'new';" };
+        },
+      },
+    });
+    secondServices.evalCacheKey = 'second-semantics';
+    secondServices.asyncResolve = async (what) =>
+      what === 'slow' ? secondSlowModule : null;
+
+    const broker = new EvalBroker(firstServices, firstServices.asyncResolve);
+
+    try {
+      const firstEntrypoint = Entrypoint.createRoot(
+        firstServices,
+        firstEntry,
+        ['__wywPreval'],
+        firstSource
+      );
+      expect(
+        (await broker.evaluate(firstEntrypoint, firstServices)).values?.get(
+          'value'
+        )
+      ).toBe('first');
+      await firstStarted.promise;
+
+      const secondEntrypoint = Entrypoint.createRoot(
+        secondServices,
+        secondEntry,
+        ['__wywPreval'],
+        secondSource
+      );
+      const secondEval = broker.evaluate(secondEntrypoint, secondServices);
+      secondEval.catch(() => undefined);
+      await secondStarted.promise;
+
+      // The first LOAD finishes only after the second INIT established a new
+      // session. Its continuation must stay abandoned instead of populating
+      // the new runner caches or satisfying the second import.
+      firstGate.resolve();
+      const stillPending = Symbol('still-pending');
+      expect(
+        await Promise.race([
+          secondEval.then((result) => result.values?.get('value')),
+          new Promise<symbol>((resolveTimeout) => {
+            setTimeout(() => resolveTimeout(stillPending), 100);
+          }),
+        ])
+      ).toBe(stillPending);
+
+      secondGate.resolve();
+      expect((await secondEval).values?.get('value')).toBe('new');
+      expect(firstLoads).toBe(1);
+      expect(secondLoads).toBe(1);
+    } finally {
+      firstGate.resolve();
+      secondGate.resolve();
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a later batched evaluation after an INIT failure', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const badEntry = join(root, 'bad.js');
+    const goodEntry = join(root, 'good.js');
+    const source = 'export const __wywPreval = { value: () => 42 };';
+    writeFileSync(badEntry, source);
+    writeFileSync(goodEntry, source);
+
+    const badServices = createServices(root, badEntry, {
+      eval: {
+        globals: {
+          BROKEN_FN: {
+            __wyw_eval_global: {
+              signature: 'wyw-eval-global',
+              version: 1,
+              kind: 'function',
+              source: 'function () {',
+            },
+          },
+        },
+      },
+    });
+    badServices.evalCacheKey = 'bad-init';
+    badServices.asyncResolve = async () => null;
+    const goodServices = createServices(root, goodEntry);
+    goodServices.evalCacheKey = 'good-init';
+    goodServices.asyncResolve = async () => null;
+    const broker = new EvalBroker(badServices, async () => null);
+
+    try {
+      const bad = Entrypoint.createRoot(
+        badServices,
+        badEntry,
+        ['__wywPreval'],
+        source
+      );
+      const good = Entrypoint.createRoot(
+        goodServices,
+        goodEntry,
+        ['__wywPreval'],
+        source
+      );
+      const [badResult, goodResult] = await Promise.allSettled([
+        broker.evaluate(bad, badServices),
+        broker.evaluate(good, goodServices),
+      ]);
+
+      expect(badResult.status).toBe('rejected');
+      if (badResult.status === 'rejected') {
+        expect(badResult.reason).toEqual(
+          expect.objectContaining({
+            message: expect.stringContaining(
+              'Failed to restore eval.globals function'
+            ),
+          })
+        );
+      }
+      expect(goodResult.status).toBe('fulfilled');
+      if (goodResult.status === 'fulfilled') {
+        expect(goodResult.value.values?.get('value')).toBe(42);
+      }
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('makes dispose terminal and rejects active and scheduled evaluations', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const slowModule = join(root, 'slow.js');
+    const source = [
+      "import { value } from 'slow';",
+      'export const __wywPreval = { value: () => value };',
+    ].join('\n');
+    writeFileSync(entry, source);
+    writeFileSync(slowModule, 'export const value = 42;');
+
+    let releaseSlow!: () => void;
+    let markSlowStarted!: () => void;
+    const slowGate = new Promise<void>((resolveGate) => {
+      releaseSlow = resolveGate;
+    });
+    const slowStarted = new Promise<void>((resolveStarted) => {
+      markSlowStarted = resolveStarted;
+    });
+    const services = createServices(root, entry, {
+      eval: {
+        customLoader: async (id) => {
+          if (id !== slowModule) return undefined;
+          markSlowStarted();
+          await slowGate;
+          return { code: 'export const value = 42;' };
+        },
+      },
+    });
+    services.asyncResolve = async (what) =>
+      what === 'slow' ? slowModule : null;
+    const broker = new EvalBroker(services, services.asyncResolve);
+    const entrypoint = Entrypoint.createRoot(
+      services,
+      entry,
+      ['__wywPreval'],
+      source
+    );
+
+    try {
+      const active = broker.evaluate(entrypoint, services);
+      active.catch(() => undefined);
+      await slowStarted;
+      broker.dispose();
+      await expect(active).rejects.toThrow('Eval broker has been disposed');
+      await expect(broker.evaluate(entrypoint, services)).rejects.toThrow(
+        'Eval broker has been disposed'
+      );
+      expect(getPrivateBroker(broker).runner).toBeNull();
+
+      const scheduledBroker = new EvalBroker(services, services.asyncResolve);
+      const scheduled = scheduledBroker.evaluate(entrypoint, services);
+      scheduled.catch(() => undefined);
+      scheduledBroker.dispose();
+      await expect(scheduled).rejects.toThrow('Eval broker has been disposed');
+      await new Promise<void>((resolveImmediate) => {
+        setImmediate(resolveImmediate);
+      });
+      expect(getPrivateBroker(scheduledBroker).runner).toBeNull();
+    } finally {
+      releaseSlow();
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not activate an isolated runner after terminal disposal', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const source = 'export const __wywPreval = { value: () => 42 };';
+    writeFileSync(entry, source);
+    const services = createServices(root, entry, {
+      features: { happyDOM: true },
+    });
+    const broker = new EvalBroker(services, async () => null);
+    const entrypoint = Entrypoint.createRoot(
+      services,
+      entry,
+      ['__wywPreval'],
+      source
+    );
+    const oldRunner = {
+      kill: jest.fn(() => true),
+      removeAllListeners: jest.fn(),
+    };
+    const candidateRunner = {
+      kill: jest.fn(() => true),
+    };
+    let resolveCandidate!: (runner: unknown) => void;
+    const candidate = new Promise<unknown>((resolveRunner) => {
+      resolveCandidate = resolveRunner;
+    });
+    const privateBroker = broker as unknown as {
+      happyDomDisabled: boolean;
+      initIsolatedRunner: jest.Mock<Promise<unknown>, [unknown, number]>;
+      initRunner: (value: Entrypoint) => Promise<void>;
+      lastHappyDomEnabled: boolean;
+      lastInitKey: string | null;
+      replaceRunner: jest.Mock;
+      runner: unknown;
+    };
+    privateBroker.runner = oldRunner;
+    privateBroker.lastInitKey = 'previous-init';
+    privateBroker.lastHappyDomEnabled = false;
+    privateBroker.happyDomDisabled = false;
+    privateBroker.initIsolatedRunner = jest.fn(() => candidate);
+    privateBroker.replaceRunner = jest.fn();
+
+    try {
+      const initializing = privateBroker.initRunner(entrypoint);
+      initializing.catch(() => undefined);
+      await Promise.resolve();
+      expect(privateBroker.initIsolatedRunner).toHaveBeenCalledTimes(1);
+
+      broker.dispose();
+      resolveCandidate(candidateRunner);
+
+      await expect(initializing).rejects.toThrow(
+        'Eval broker has been disposed'
+      );
+      expect(candidateRunner.kill).toHaveBeenCalledTimes(1);
+      expect(privateBroker.replaceRunner).not.toHaveBeenCalled();
+      expect(privateBroker.runner).toBeNull();
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('recreates a registry broker after direct terminal disposal', () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    writeFileSync(entry, 'export const __wywPreval = {};');
+    const services = createServices(root, entry);
+    const scope = {};
+    services.evalBrokerScope = scope;
+    const resolver = async () => null;
+
+    try {
+      const first = getEvalBroker(services, resolver, 'stable-key');
+      first.dispose();
+      const second = getEvalBroker(services, resolver, 'stable-key');
+
+      expect(second).not.toBe(first);
+      expect(second.isDisposed).toBe(false);
+    } finally {
+      disposeEvalBroker(scope);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('collects dependency edges from ignored modules shipped verbatim', () => {
@@ -4442,7 +5123,7 @@ describe('EvalBroker', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('link failure against errored module includes root cause in error.cause', async () => {
+  it('restarts failed module graphs without hiding the root error', async () => {
     const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
 
     // thrower.js — body throws during evaluation
@@ -4490,7 +5171,8 @@ describe('EvalBroker', () => {
     );
     await expect(broker.evaluate(epFail)).rejects.toThrow();
 
-    // Session 2: consumer.js tries to link against the cached errored thrower.js
+    // Session 2 starts with a fresh VM graph after the failed EVAL. The
+    // original module error must still be surfaced directly.
     const epConsumer = Entrypoint.createRoot(
       services,
       join(root, 'consumer.js'),
@@ -4504,10 +5186,8 @@ describe('EvalBroker', () => {
     } catch (err) {
       expect(err).toBeInstanceOf(Error);
       const error = err as Error;
-      expect(error.message).toMatch(/errored module/);
-      expect(error.message).toMatch(/Root cause:.*kaboom/);
-      expect(error.cause).toBeInstanceOf(Error);
-      expect((error.cause as Error).message).toBe('kaboom');
+      expect(error.message).toBe('kaboom');
+      expect(error.stack).toContain('thrower.js');
     }
 
     broker.dispose();
@@ -5629,6 +6309,64 @@ describe('EvalBroker', () => {
 
     broker.dispose();
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not reuse a semantic session after INIT fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    writeFileSync(entry, 'export const __wywPreval = {};');
+    const services = createServices(root, entry);
+    services.evalCacheKey = 'stable-semantics';
+    const broker = new EvalBroker(
+      services,
+      jest.fn(async () => null)
+    );
+    const privateBroker = broker as unknown as {
+      ensureRunner: jest.Mock<Promise<void>, []>;
+      initRunner: jest.Mock<Promise<void>, [Entrypoint, boolean]>;
+      loadCache: {
+        has: (id: string) => boolean;
+        set: (id: string, value: unknown) => void;
+      };
+      request: jest.Mock<Promise<unknown>, [string, unknown]>;
+    };
+    privateBroker.ensureRunner = jest.fn(async () => {});
+    privateBroker.initRunner = jest
+      .fn<Promise<void>, [Entrypoint, boolean]>()
+      .mockRejectedValueOnce(new Error('init failed'))
+      .mockResolvedValue(undefined);
+    privateBroker.request = jest.fn(async () => ({ values: null }));
+    const entrypoint = Entrypoint.createRoot(
+      services,
+      entry,
+      ['__wywPreval'],
+      readFileSync(entry, 'utf8')
+    );
+
+    try {
+      await expect(broker.evaluate(entrypoint, services)).rejects.toThrow(
+        'init failed'
+      );
+      privateBroker.loadCache.set('stale-from-failed-session', {});
+      expect(privateBroker.loadCache.has('stale-from-failed-session')).toBe(
+        true
+      );
+      await expect(broker.evaluate(entrypoint, services)).resolves.toEqual({
+        dependencies: [],
+        values: null,
+      });
+      expect(privateBroker.loadCache.has('stale-from-failed-session')).toBe(
+        false
+      );
+      expect(
+        privateBroker.initRunner.mock.calls.map(
+          ([, reuseModules]) => reuseModules
+        )
+      ).toEqual([false, false]);
+    } finally {
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   describe('evaluate batching', () => {

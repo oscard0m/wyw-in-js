@@ -13,6 +13,21 @@ When this loader is configured through `@wyw-in-js/nextjs`, string aliases from 
 `experimental.turbo.resolveAlias` are forwarded into native resolver options. Direct `turbopack.rules` usage should mirror
 Turbopack-only aliases in `oxcOptions.resolver.alias` or use `hybrid` so the bundler fallback can resolve them.
 
+By default the loader reuses the eval child process but isolates transform
+caches, resolver results, WyW-managed evaluated modules, and top-level globals
+created in their VM context for every invocation. This is necessary because
+Turbopack's loader API does not expose a compilation identity that
+distinguishes server, client, and edge resolver graphs. Node host state remains
+process-scoped, including built-ins, `process.env`, external CommonJS
+`require.cache` entries, and external ESM module instances.
+
+`resolverScopeKey` opts into transform-cache, evaluated-module, and VM-context
+reuse. Use it only when every invocation with that key has identical complete
+transform and eval configuration, aliases, conditions, and graph semantics.
+Use different keys for scopes such as server, client, and edge builds, and use
+a finite, stable set of keys because their state lives for the loader module's
+lifetime.
+
 ## Output strategy
 
 When a file produces CSS, the loader:

@@ -17,6 +17,7 @@ export const withDefaultServices = ({
   log = rootLog,
   options,
   asyncResolveKey,
+  evalBrokerScope,
 }: PartialServices): Services => ({
   cache,
   emitWarning,
@@ -26,4 +27,5 @@ export const withDefaultServices = ({
   log,
   options,
   asyncResolveKey,
+  evalBrokerScope,
 });

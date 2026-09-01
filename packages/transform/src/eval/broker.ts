@@ -16,9 +16,12 @@ import type {
 import { isFeatureEnabled } from '@wyw-in-js/shared';
 
 import type { Entrypoint } from '../transform/Entrypoint';
+import { TransformCacheCollection } from '../cache';
 import type { ParentEntrypoint } from '../types';
 import { isStaticallyEvaluatableModule } from '../transform/isStaticallyEvaluatableModule';
 import type { Services } from '../transform/types';
+import { EventEmitter } from '../utils/EventEmitter';
+import { rootLog } from '../transform/rootLog';
 import {
   applyImportOverrideToOnly,
   getImportOverride,
@@ -33,7 +36,11 @@ import {
   hasCachedWywPrevalExport,
   type CachedEntrypointLike,
 } from '../utils/hasCachedWywPrevalExport';
-import { isSuperSet, mergeOnly } from '../transform/Entrypoint.helpers';
+import {
+  isSuperSet,
+  loadAndParse,
+  mergeOnly,
+} from '../transform/Entrypoint.helpers';
 import { oxcShaker } from '../shaker';
 import { analyzeOxcBarrelFile } from '../transform/oxcBarrelManifest';
 import {
@@ -441,6 +448,14 @@ type PendingRequest = {
   resolve: (payload: unknown) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
+};
+
+type EvalRequestContext = {
+  epoch: number;
+  inputQueue: WriteQueue;
+  runner: ChildProcessWithoutNullStreams;
+  sessionId: number;
+  services: Services;
 };
 
 type EvaluateResult = {
@@ -1085,18 +1100,54 @@ const toSerializedError = (error: unknown) => {
   };
 };
 
+const createDetachedServices = (services: Services): Services => ({
+  ...services,
+  asyncResolve: undefined,
+  cache: new TransformCacheCollection(),
+  emitWarning: undefined,
+  evalBroker: undefined,
+  eventEmitter: EventEmitter.dummy,
+  loadAndParseFn: loadAndParse,
+  loadDependencyCode: undefined,
+  log: rootLog,
+  options: {
+    ...services.options,
+    inputSourceMap: undefined,
+  },
+});
+
 export class EvalBroker {
   private runner: ChildProcessWithoutNullStreams | null = null;
 
   private runnerInputQueue: WriteQueue | null = null;
 
+  private runnerOutputBuffer = '';
+
+  private requestEpoch = 0;
+
+  private nextRunnerSessionId = 0;
+
+  private activeRunnerSessionId = 0;
+
   private runnerReady: Promise<void> | null = null;
+
+  private readonly isolatedRunners = new Set<ChildProcessWithoutNullStreams>();
 
   private lastInitKey: string | null = null;
 
   private lastHappyDomEnabled = false;
 
+  private hasSemanticSession = false;
+
+  private semanticSessionKey: string | Services | undefined;
+
   private evalQueue: Promise<void> = Promise.resolve();
+
+  private disposed = false;
+
+  public get isDisposed(): boolean {
+    return this.disposed;
+  }
 
   private readonly pending = new Map<string, PendingRequest>();
 
@@ -1177,21 +1228,61 @@ export class EvalBroker {
 
   private currentServices: Services;
 
+  private readonly detachedServices: Services | null;
+
   private readonly sendLoadMessage = (
     message: MainToRunnerMessage,
     onSerialized?: (bytes: number) => void
   ): Promise<void> => this.sendMessage(message, onSerialized);
 
   constructor(
-    private readonly services: Services,
-    private readonly asyncResolve: (
+    services: Services,
+    private readonly fallbackAsyncResolve: (
       what: string,
       importer: string,
       stack: string[]
-    ) => Promise<string | null>
+    ) => Promise<string | null>,
+    detachServicesWhenIdle = false
   ) {
     this.currentServices = services;
+    this.detachedServices = detachServicesWhenIdle
+      ? createDetachedServices(services)
+      : null;
     this.recordBrokerLifecycle('broker-created', 'constructor');
+    this.detachCurrentServices();
+  }
+
+  private detachCurrentServices(): void {
+    if (this.detachedServices) {
+      this.currentServices = this.detachedServices;
+    }
+  }
+
+  private beginRunnerSession(
+    payload: EvalRunnerInitPayload
+  ): EvalRunnerInitPayload {
+    this.nextRunnerSessionId += 1;
+    this.activeRunnerSessionId = this.nextRunnerSessionId;
+    return { ...payload, sessionId: this.activeRunnerSessionId };
+  }
+
+  private beginIsolatedRunnerSession(payload: EvalRunnerInitPayload): {
+    payload: EvalRunnerInitPayload;
+    sessionId: number;
+  } {
+    this.nextRunnerSessionId += 1;
+    return {
+      payload: { ...payload, sessionId: this.nextRunnerSessionId },
+      sessionId: this.nextRunnerSessionId,
+    };
+  }
+
+  private async initActiveRunner(
+    payload: EvalRunnerInitPayload,
+    timeoutMs: number
+  ): Promise<void> {
+    const sessionPayload = this.beginRunnerSession(payload);
+    await this.request('INIT', sessionPayload, timeoutMs);
   }
 
   private recordBrokerLifecycle(
@@ -1268,28 +1359,28 @@ export class EvalBroker {
       return null;
     }
 
-    const { root } = this.services.options;
+    const { root } = this.currentServices.options;
     const keyInfo = toImportKey({
       source: request,
       resolved: id,
       root,
     });
     const override = getImportOverride(
-      this.services.options.pluginOptions.importOverrides,
+      this.currentServices.options.pluginOptions.importOverrides,
       keyInfo.key
     );
     let nextOnly = applyImportOverrideToOnly(
       this.getImportOnly(importerId, request),
       override
     );
-    const cached = this.services.cache.get('entrypoints', id) as
+    const cached = this.currentServices.cache.get('entrypoints', id) as
       | CachedEntrypointLike
       | undefined;
     if (
       nextOnly.includes('__wywPreval') &&
       cached?.evaluated &&
       !cached.ignored &&
-      !hasCachedWywPrevalExport(this.services, id, cached)
+      !hasCachedWywPrevalExport(this.currentServices, id, cached)
     ) {
       nextOnly = nextOnly.filter((item) => item !== '__wywPreval');
     }
@@ -1301,6 +1392,9 @@ export class EvalBroker {
     entrypoint: Entrypoint,
     services?: Services
   ): Promise<EvaluateResult> {
+    if (this.disposed) {
+      throw new Error('[wyw-in-js] Eval broker has been disposed');
+    }
     const activeServices = services ?? this.currentServices;
     const telemetry = hasEvalTelemetryReporter(activeServices.eventEmitter)
       ? beginEvalTelemetry(activeServices.eventEmitter, this, () => ({
@@ -1333,38 +1427,52 @@ export class EvalBroker {
 
   private async runEvalBatch(batch: PendingEval[]): Promise<void> {
     try {
-      this.currentServices = batch[0].services ?? this.currentServices;
-      await this.ensureRunner();
-    } catch (error) {
-      for (const [batchIndex, member] of batch.entries()) {
-        member.telemetry?.start({ batchIndex, batchSize: batch.length });
-        member.telemetry?.finish('error', this.loadMirror.snapshot());
-        member.reject(error);
-      }
-      return;
-    }
-    for (const [batchIndex, member] of batch.entries()) {
-      const { telemetry } = member;
-      telemetry?.start({ batchIndex, batchSize: batch.length });
-      this.activeEvalTelemetry = telemetry;
       try {
-        const result = await this.runOneEntrypoint(
-          member.entrypoint,
-          member.services
-        );
-        telemetry?.finish(
-          result.values ? 'success' : 'no-values',
-          this.loadMirror.snapshot()
-        );
-        member.resolve(result);
+        this.currentServices = batch[0].services ?? this.currentServices;
+        await this.ensureRunner();
       } catch (error) {
-        telemetry?.finish('error', this.loadMirror.snapshot());
-        member.reject(error);
-      } finally {
-        if (this.activeEvalTelemetry === telemetry) {
-          this.activeEvalTelemetry = undefined;
+        for (const [batchIndex, member] of batch.entries()) {
+          member.telemetry?.start({ batchIndex, batchSize: batch.length });
+          member.telemetry?.finish('error', this.loadMirror.snapshot());
+          member.reject(error);
+        }
+        return;
+      }
+      let runnerRecoveryRequired = false;
+      for (const [batchIndex, member] of batch.entries()) {
+        const { telemetry } = member;
+        telemetry?.start({ batchIndex, batchSize: batch.length });
+        this.activeEvalTelemetry = telemetry;
+        try {
+          if (this.disposed) {
+            throw new Error('[wyw-in-js] Eval broker has been disposed');
+          }
+          if (runnerRecoveryRequired) {
+            this.currentServices = member.services ?? this.currentServices;
+            runnerRecoveryRequired = false;
+            await this.ensureRunner();
+          }
+          const result = await this.runOneEntrypoint(
+            member.entrypoint,
+            member.services
+          );
+          telemetry?.finish(
+            result.values ? 'success' : 'no-values',
+            this.loadMirror.snapshot()
+          );
+          member.resolve(result);
+        } catch (error) {
+          runnerRecoveryRequired = !this.disposed && this.runner === null;
+          telemetry?.finish('error', this.loadMirror.snapshot());
+          member.reject(error);
+        } finally {
+          if (this.activeEvalTelemetry === telemetry) {
+            this.activeEvalTelemetry = undefined;
+          }
         }
       }
+    } finally {
+      this.detachCurrentServices();
     }
   }
 
@@ -1375,6 +1483,21 @@ export class EvalBroker {
     const activeServices = services ?? this.currentServices;
     const resolveRootId = getEntrypointResolveRoot(entrypoint);
     this.currentServices = activeServices;
+    // configureEvalSession always provides a hash. Direct EvalBroker users
+    // predate that API, so fall back to the per-invocation Services identity
+    // instead of treating every missing key as one reusable semantic scope.
+    const nextSemanticSessionKey =
+      activeServices.evalCacheKey ?? activeServices;
+    const reuseModules =
+      this.hasSemanticSession &&
+      this.semanticSessionKey === nextSemanticSessionKey;
+    if (!reuseModules) {
+      this.resetSemanticSessionState();
+    }
+    // INIT may mutate/reset the runner before failing. Until it succeeds the
+    // next job must conservatively start a new semantic VM session.
+    this.hasSemanticSession = false;
+    this.semanticSessionKey = undefined;
     this.activeResolveRootId = resolveRootId;
     this.resetPerEntrypointState(entrypoint);
     this.evalSeq += 1;
@@ -1390,7 +1513,9 @@ export class EvalBroker {
     }
 
     try {
-      await this.initRunner(entrypoint);
+      await this.initRunner(entrypoint, reuseModules);
+      this.hasSemanticSession = true;
+      this.semanticSessionKey = nextSemanticSessionKey;
 
       const payload = await this.request<EvalResultPayload>(
         'EVAL',
@@ -1427,6 +1552,20 @@ export class EvalBroker {
         values,
         dependencies: this.collectEntrypointDependencies(entrypoint.name),
       };
+    } catch (error) {
+      // A failed EVAL can leave arbitrary async work running in its VM. Stop
+      // that child so no continuation can mutate the next semantic session.
+      this.hasSemanticSession = false;
+      this.semanticSessionKey = undefined;
+      const failedRunner = this.runner;
+      if (failedRunner) {
+        this.retireRunner(
+          failedRunner,
+          'eval-error',
+          error instanceof Error ? error : new Error(String(error))
+        );
+      }
+      throw error;
     } finally {
       this.evalFileDebugLines = null;
       if (this.activeResolveRootId === resolveRootId) {
@@ -1501,6 +1640,7 @@ export class EvalBroker {
   }
 
   private resetPerEntrypointState(entrypoint: Entrypoint) {
+    this.requestEpoch += 1;
     this.runtimeDependenciesByModule.clear();
     this.emittedDependencies.clear();
     this.importsByModule.clear();
@@ -1512,6 +1652,22 @@ export class EvalBroker {
     this.onlyByModule.set(entrypoint.name, ['__wywPreval']);
   }
 
+  private resetSemanticSessionState() {
+    this.requestEpoch += 1;
+    this.loadCache.clear();
+    this.loadInFlight.clear();
+    this.resolveCache.clear();
+    this.resolveInFlight.clear();
+    this.importsByModule.clear();
+    this.onlyByModule.clear();
+    this.runtimeDependenciesByModule.clear();
+    this.emittedDependencies.clear();
+    this.loadMirror.clear();
+    this.sessionLinkGraph.clear();
+    this.lastInitKey = null;
+    this.stableInitHashCache = null;
+  }
+
   private applyModuleExports(
     modules: Record<string, Record<string, SerializedValue>>
   ) {
@@ -1520,7 +1676,7 @@ export class EvalBroker {
         return;
       }
 
-      const cached = this.services.cache.get('entrypoints', id);
+      const cached = this.currentServices.cache.get('entrypoints', id);
       if (!cached || cached.ignored) {
         return;
       }
@@ -1536,7 +1692,11 @@ export class EvalBroker {
         exportsProxy[key] = deserializeValue(serialized);
       });
 
-      const knownExports = collectKnownExportNames(this.services, id, target);
+      const knownExports = collectKnownExportNames(
+        this.currentServices,
+        id,
+        target
+      );
       const serializedKeys = Object.keys(serializedExports);
       const coversAllKnownExports =
         Array.isArray(knownExports) &&
@@ -1553,22 +1713,62 @@ export class EvalBroker {
         target.evaluatedOnly.splice(0, target.evaluatedOnly.length, ...merged);
       }
 
-      this.services.cache.add('entrypoints', id, target);
+      this.currentServices.cache.add('entrypoints', id, target);
     });
   }
 
-  public dispose(reason = 'explicit') {
-    this.recordBrokerLifecycle('broker-dispose-observed', reason, true);
-    if (this.runner) {
-      this.recordBrokerLifecycle('runner-stop-requested', reason, true);
-      this.runner.removeAllListeners();
-      this.runner.kill();
-      this.runner = null;
-      this.runnerReady = null;
-      this.runnerInputQueue = null;
-    }
+  private retireRunner(
+    runner: ChildProcessWithoutNullStreams,
+    reason: string,
+    error: Error
+  ): void {
+    if (this.runner !== runner) return;
+
+    this.recordBrokerLifecycle('runner-stop-requested', reason, true);
+    this.rejectAllPending(error);
+    this.runner = null;
+    this.runnerReady = null;
+    this.runnerInputQueue = null;
     this.lastInitKey = null;
     this.lastHappyDomEnabled = false;
+    this.hasSemanticSession = false;
+    this.semanticSessionKey = undefined;
+    this.activeRunnerSessionId = 0;
+    this.requestEpoch += 1;
+    this.runnerOutputBuffer = '';
+    this.loadMirror.clear();
+    this.pendingModuleResets.clear();
+    this.sessionLinkGraph.clear();
+    runner.removeAllListeners();
+    runner.kill();
+  }
+
+  public dispose(reason = 'explicit') {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.recordBrokerLifecycle('broker-dispose-observed', reason, true);
+    const error = new Error('[wyw-in-js] Eval broker has been disposed');
+    const queued = this.pendingEvals;
+    this.pendingEvals = [];
+    for (const member of queued) {
+      member.reject(error);
+    }
+    if (this.runner) {
+      this.retireRunner(this.runner, reason, error);
+    } else {
+      this.rejectAllPending(error);
+    }
+    for (const isolatedRunner of this.isolatedRunners) {
+      isolatedRunner.kill();
+    }
+    this.isolatedRunners.clear();
+    this.lastInitKey = null;
+    this.lastHappyDomEnabled = false;
+    this.hasSemanticSession = false;
+    this.semanticSessionKey = undefined;
+    this.activeRunnerSessionId = 0;
+    this.requestEpoch += 1;
+    this.runnerOutputBuffer = '';
     this.loadMirror.clear();
     this.pendingModuleResets.clear();
     this.sessionLinkGraph.clear();
@@ -1588,7 +1788,7 @@ export class EvalBroker {
       ['--experimental-vm-modules', runnerPath],
       {
         stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: this.services.options.root ?? process.cwd(),
+        cwd: this.currentServices.options.root ?? process.cwd(),
         env: {
           ...process.env,
           WYW_EVAL_RUNNER: '1',
@@ -1603,9 +1803,12 @@ export class EvalBroker {
   }
 
   private attachRunnerListeners(runner: ChildProcessWithoutNullStreams) {
-    runner.stdout.on('data', (chunk) => this.onData(String(chunk)));
+    this.runnerOutputBuffer = '';
+    runner.stdout.on('data', (chunk) => this.onData(runner, String(chunk)));
     runner.stderr.on('data', (chunk: Buffer) => {
-      this.handleRunnerStderr(chunk);
+      if (this.runner === runner) {
+        this.handleRunnerStderr(chunk);
+      }
     });
     runner.on('exit', (code, signal) => {
       if (this.runner !== runner) {
@@ -1621,6 +1824,11 @@ export class EvalBroker {
       this.runnerReady = null;
       this.lastInitKey = null;
       this.lastHappyDomEnabled = false;
+      this.hasSemanticSession = false;
+      this.semanticSessionKey = undefined;
+      this.activeRunnerSessionId = 0;
+      this.requestEpoch += 1;
+      this.runnerOutputBuffer = '';
       this.loadMirror.clear();
       this.pendingModuleResets.clear();
       this.sessionLinkGraph.clear();
@@ -1628,8 +1836,14 @@ export class EvalBroker {
   }
 
   private async ensureRunner() {
+    if (this.disposed) {
+      throw new Error('[wyw-in-js] Eval broker has been disposed');
+    }
     if (this.runnerReady) {
       await this.runnerReady;
+      if (this.disposed) {
+        throw new Error('[wyw-in-js] Eval broker has been disposed');
+      }
       return;
     }
 
@@ -1641,6 +1855,9 @@ export class EvalBroker {
     this.attachRunnerListeners(this.runner);
     this.runnerReady = Promise.resolve();
     await this.runnerReady;
+    if (this.disposed) {
+      throw new Error('[wyw-in-js] Eval broker has been disposed');
+    }
     this.recordBrokerLifecycle('runner-activated', 'ensure');
   }
 
@@ -1649,6 +1866,7 @@ export class EvalBroker {
     timeoutMs: number
   ): Promise<ChildProcessWithoutNullStreams> {
     const runner = this.createRunnerProcess('happy-dom-candidate');
+    this.isolatedRunners.add(runner);
     const requestId = `candidate-init-${++this.nextId}`;
     let buffer = '';
 
@@ -1656,6 +1874,7 @@ export class EvalBroker {
       let settled = false;
 
       const cleanup = () => {
+        this.isolatedRunners.delete(runner);
         runner.stdout.off('data', onStdout);
         runner.stderr.off('data', onStderr);
         runner.off('exit', onExit);
@@ -1710,7 +1929,7 @@ export class EvalBroker {
             message = JSON.parse(line);
           } catch {
             emitWarning(
-              this.services,
+              this.currentServices,
               `[wyw-eval-runner] Failed to parse message: ${line}`
             );
             return;
@@ -1775,6 +1994,7 @@ export class EvalBroker {
       this.runner.kill();
     }
 
+    this.requestEpoch += 1;
     this.runner = nextRunner;
     this.runnerInputQueue = createWriteQueue(
       nextRunner.stdin,
@@ -1827,22 +2047,23 @@ export class EvalBroker {
     return hash;
   }
 
-  private async initRunner(entrypoint: Entrypoint) {
+  private async initRunner(entrypoint: Entrypoint, reuseModules = true) {
     const features = this.getRunnerFeatures();
     const stableHash = this.getStableInitHash(this.currentServices, features);
     const debugEvalFiles = this.currentServices.eventEmitter.enabled;
     const debugEvalFilesKeyPart = debugEvalFiles ? '1' : '0';
     const initKey = `${stableHash}::${entrypoint.name}::debugEvalFiles:${debugEvalFilesKeyPart}`;
-    if (this.lastInitKey === initKey) {
-      return;
-    }
     const nextHappyDomEnabled = isFeatureEnabled(
       features,
       'happyDOM',
       entrypoint.name
     );
-    const payload = buildRunnerInitPayload(this.services, entrypoint, features);
-    payload.reuseModules = true;
+    const payload = buildRunnerInitPayload(
+      this.currentServices,
+      entrypoint,
+      features
+    );
+    payload.reuseModules = reuseModules;
     if (debugEvalFiles) {
       payload.debugEvalFiles = true;
     }
@@ -1856,8 +2077,17 @@ export class EvalBroker {
       !this.happyDomDisabled
     ) {
       try {
-        const nextRunner = await this.initIsolatedRunner(payload, timeoutMs);
+        const candidateSession = this.beginIsolatedRunnerSession(payload);
+        const nextRunner = await this.initIsolatedRunner(
+          candidateSession.payload,
+          timeoutMs
+        );
+        if (this.disposed) {
+          nextRunner.kill();
+          throw new Error('[wyw-in-js] Eval broker has been disposed');
+        }
         this.replaceRunner(nextRunner);
+        this.activeRunnerSessionId = candidateSession.sessionId;
         this.lastInitKey = initKey;
         this.lastHappyDomEnabled = true;
         return;
@@ -1867,15 +2097,15 @@ export class EvalBroker {
           this.warnHappyDomDisabledOnce(timeoutMs);
           const fallbackFeatures = this.getRunnerFeatures();
           const fallbackPayload = buildRunnerInitPayload(
-            this.services,
+            this.currentServices,
             entrypoint,
             fallbackFeatures
           );
-          fallbackPayload.reuseModules = true;
+          fallbackPayload.reuseModules = reuseModules;
           if (debugEvalFiles) {
             fallbackPayload.debugEvalFiles = true;
           }
-          await this.request('INIT', fallbackPayload, INIT_TIMEOUT_MS);
+          await this.initActiveRunner(fallbackPayload, INIT_TIMEOUT_MS);
           this.lastInitKey = `${this.getStableInitHash(
             this.currentServices,
             fallbackFeatures
@@ -1889,7 +2119,7 @@ export class EvalBroker {
     }
 
     try {
-      await this.request('INIT', payload, timeoutMs);
+      await this.initActiveRunner(payload, timeoutMs);
       this.lastInitKey = initKey;
       this.lastHappyDomEnabled = nextHappyDomEnabled;
     } catch (error) {
@@ -1900,19 +2130,26 @@ export class EvalBroker {
       ) {
         this.happyDomDisabled = true;
         this.warnHappyDomDisabledOnce(timeoutMs);
-        this.dispose('happy-dom-timeout-recovery');
+        const timedOutRunner = this.runner;
+        if (timedOutRunner) {
+          this.retireRunner(
+            timedOutRunner,
+            'happy-dom-timeout-recovery',
+            error instanceof Error ? error : new Error(String(error))
+          );
+        }
         await this.ensureRunner();
         const fallbackFeatures = this.getRunnerFeatures();
         const fallbackPayload = buildRunnerInitPayload(
-          this.services,
+          this.currentServices,
           entrypoint,
           fallbackFeatures
         );
-        fallbackPayload.reuseModules = true;
+        fallbackPayload.reuseModules = reuseModules;
         if (debugEvalFiles) {
           fallbackPayload.debugEvalFiles = true;
         }
-        await this.request('INIT', fallbackPayload, INIT_TIMEOUT_MS);
+        await this.initActiveRunner(fallbackPayload, INIT_TIMEOUT_MS);
         this.lastInitKey = `${this.getStableInitHash(
           this.currentServices,
           fallbackFeatures
@@ -1925,7 +2162,7 @@ export class EvalBroker {
   }
 
   private getRunnerFeatures(): FeatureFlags<'happyDOM'> {
-    const base = this.services.options.pluginOptions.features;
+    const base = this.currentServices.options.pluginOptions.features;
     if (!this.happyDomDisabled) return base;
     return { ...base, happyDOM: false };
   }
@@ -1953,7 +2190,7 @@ export class EvalBroker {
     if (this.happyDomDisableWarned) return;
     this.happyDomDisableWarned = true;
     emitWarning(
-      this.services,
+      this.currentServices,
       [
         `[wyw-in-js] DOM emulation initialization exceeded ${timeoutMs}ms and will be disabled for this run.`,
         `WyW will continue without DOM emulation (as if features.happyDOM:false).`,
@@ -1965,11 +2202,14 @@ export class EvalBroker {
     );
   }
 
-  private onData(chunk: string) {
-    const buffer = (this.onData as { buffer?: string }).buffer ?? '';
-    const next = `${buffer}${chunk}`;
+  private onData(runner: ChildProcessWithoutNullStreams, chunk: string) {
+    if (this.runner !== runner) {
+      return;
+    }
+
+    const next = `${this.runnerOutputBuffer}${chunk}`;
     const lines = next.split('\n');
-    (this.onData as { buffer?: string }).buffer = lines.pop() ?? '';
+    this.runnerOutputBuffer = lines.pop() ?? '';
     lines.forEach((line) => {
       if (!line.trim()) return;
       let message: RunnerToMainMessage;
@@ -1977,27 +2217,32 @@ export class EvalBroker {
         message = JSON.parse(line);
       } catch (error) {
         emitWarning(
-          this.services,
+          this.currentServices,
           `[wyw-eval-runner] Failed to parse message: ${line}`
         );
         return;
       }
 
-      this.handleMessage(message);
+      this.handleMessage(message, runner);
     });
   }
 
-  private handleMessage(message: RunnerToMainMessage) {
+  private handleMessage(
+    message: RunnerToMainMessage,
+    runner: ChildProcessWithoutNullStreams | null = this.runner
+  ) {
     switch (message.type) {
       case 'INIT_ACK':
         if (message.error) {
           this.rejectPending(message.id, message.error);
-          this.recordBrokerLifecycle(
-            'runner-stop-requested',
-            'init-error',
-            true
-          );
-          this.runner?.kill();
+          const failedRunner = runner ?? this.runner;
+          if (failedRunner) {
+            this.retireRunner(
+              failedRunner,
+              'init-error',
+              new Error(message.error.message)
+            );
+          }
           return;
         }
         if (message.modulesReset) {
@@ -2039,23 +2284,41 @@ export class EvalBroker {
         this.resolvePending(message.id, message.payload);
         return;
       }
-      case 'RESOLVE':
-        this.handleResolve(message.id, message.payload).catch((error) => {
-          void this.sendMessage({
-            type: 'RESOLVE_RESULT',
-            id: message.id,
-            payload: {
-              resolvedId: null,
-              error: toSerializedError(error),
-            },
-          }).catch((sendError) => this.handleSendMessageError(sendError));
-        });
-        return;
-      case 'LOAD': {
-        const telemetry = this.activeEvalTelemetry;
-        this.handleLoad(message.id, message.payload, telemetry).catch(
+      case 'RESOLVE': {
+        const context = runner
+          ? this.captureRequestContext(runner, message.sessionId) ?? undefined
+          : undefined;
+        if (runner && !context) return;
+        this.handleResolve(message.id, message.payload, context).catch(
           (error) => {
-            void this.sendLoadResult(
+            if (!this.isRequestContextActive(context)) return;
+            void this.sendMessageForRequest(context, {
+              type: 'RESOLVE_RESULT',
+              id: message.id,
+              payload: {
+                resolvedId: null,
+                error: toSerializedError(error),
+              },
+            }).catch((sendError) => {
+              if (this.isRequestContextActive(context)) {
+                this.handleSendMessageError(sendError);
+              }
+            });
+          }
+        );
+        return;
+      }
+      case 'LOAD': {
+        const context = runner
+          ? this.captureRequestContext(runner, message.sessionId) ?? undefined
+          : undefined;
+        if (runner && !context) return;
+        const telemetry = this.activeEvalTelemetry;
+        this.handleLoad(message.id, message.payload, telemetry, context).catch(
+          (error) => {
+            if (!this.isRequestContextActive(context)) return;
+            void this.sendLoadResultForRequest(
+              context,
               message.id,
               {
                 id: message.payload.id,
@@ -2064,7 +2327,11 @@ export class EvalBroker {
               telemetry
                 ? { details: { mode: 'error' }, token: telemetry }
                 : undefined
-            ).catch((sendError) => this.handleSendMessageError(sendError));
+            ).catch((sendError) => {
+              if (this.isRequestContextActive(context)) {
+                this.handleSendMessageError(sendError);
+              }
+            });
           }
         );
         return;
@@ -2074,6 +2341,53 @@ export class EvalBroker {
         break;
       default:
         break;
+    }
+  }
+
+  private captureRequestContext(
+    runner: ChildProcessWithoutNullStreams,
+    sessionId: number | undefined
+  ): EvalRequestContext | null {
+    const inputQueue = this.runnerInputQueue;
+    if (
+      this.runner !== runner ||
+      !inputQueue ||
+      sessionId !== this.activeRunnerSessionId
+    ) {
+      return null;
+    }
+
+    return {
+      epoch: this.requestEpoch,
+      inputQueue,
+      runner,
+      sessionId,
+      services: this.currentServices,
+    };
+  }
+
+  private isRequestContextActive(
+    context: EvalRequestContext | undefined
+  ): boolean {
+    if (!context) return true;
+    return (
+      context.epoch === this.requestEpoch &&
+      context.runner === this.runner &&
+      context.sessionId === this.activeRunnerSessionId &&
+      context.services === this.currentServices &&
+      context.inputQueue === this.runnerInputQueue
+    );
+  }
+
+  private assertRequestContextActive(
+    context: EvalRequestContext | undefined
+  ): void {
+    if (!this.isRequestContextActive(context)) {
+      const error = new Error(
+        '[wyw-in-js] Ignoring a stale eval runner request'
+      );
+      error.name = 'StaleEvalRequestError';
+      throw error;
     }
   }
 
@@ -2100,8 +2414,13 @@ export class EvalBroker {
     emitEvalWarning(this.currentServices, warning);
   }
 
-  private async handleResolve(id: string, payload: ResolveRequestPayload) {
-    const result = await this.resolveImport(payload);
+  private async handleResolve(
+    id: string,
+    payload: ResolveRequestPayload,
+    context?: EvalRequestContext
+  ) {
+    const result = await this.resolveImport(payload, context);
+    this.assertRequestContextActive(context);
 
     if (debugEvalEnabled) {
       debugAction({
@@ -2116,7 +2435,7 @@ export class EvalBroker {
       });
     }
 
-    await this.sendMessage({
+    await this.sendMessageForRequest(context, {
       type: 'RESOLVE_RESULT',
       id,
       payload: {
@@ -2152,7 +2471,7 @@ export class EvalBroker {
     }
 
     const suffix = resolvedId.slice(stripped.length);
-    for (const ext of this.services.options.pluginOptions.extensions) {
+    for (const ext of this.currentServices.options.pluginOptions.extensions) {
       const fileCandidate = `${candidate}${ext}`;
       if (fs.existsSync(fileCandidate)) {
         return `${fileCandidate}${suffix}`;
@@ -2168,7 +2487,7 @@ export class EvalBroker {
       try {
         const importerFile = stripQueryAndHash(importerId);
         const { conditionNames, extensions, oxcOptions } =
-          this.services.options.pluginOptions;
+          this.currentServices.options.pluginOptions;
         const resolved = resolveWithNativeResolver({
           conditionNames,
           extensions,
@@ -2196,16 +2515,17 @@ export class EvalBroker {
     return resolvedId;
   }
 
-  private async resolveImport({
-    specifier,
-    importerId,
-    kind,
-  }: ResolveRequestPayload): Promise<ResolveResult> {
-    return this.services.eventEmitter.action(
+  private async resolveImport(
+    { specifier, importerId, kind }: ResolveRequestPayload,
+    context?: EvalRequestContext
+  ): Promise<ResolveResult> {
+    this.assertRequestContextActive(context);
+    const services = context?.services ?? this.currentServices;
+    return services.eventEmitter.action(
       'eval:resolveImport',
       `${importerId}\0${kind}\0${specifier}`,
       importerId,
-      () => this.resolveImportImpl({ specifier, importerId, kind })
+      () => this.resolveImportImpl({ specifier, importerId, kind }, context)
     );
   }
 
@@ -2217,17 +2537,18 @@ export class EvalBroker {
     return [importerId, this.activeResolveRootId];
   }
 
-  private async resolveImportImpl({
-    specifier,
-    importerId,
-    kind,
-  }: ResolveRequestPayload): Promise<ResolveResult> {
+  private async resolveImportImpl(
+    { specifier, importerId, kind }: ResolveRequestPayload,
+    context?: EvalRequestContext
+  ): Promise<ResolveResult> {
+    this.assertRequestContextActive(context);
     if (process.env.WYW_DEBUG_EVAL_RESOLVE) {
       // eslint-disable-next-line no-console
       console.warn('[wyw-eval:resolve]', { specifier, importerId, kind });
     }
     const key = `${kind}:${importerId}:${specifier}`;
-    const evalOptions = getEvalOptions(this.services);
+    const services = context?.services ?? this.currentServices;
+    const evalOptions = getEvalOptions(services);
     const stack = this.getResolveStack(importerId);
     const importsOnly = this.importsByModule.get(importerId)?.get(specifier);
     const only = this.getImportOnly(importerId, specifier);
@@ -2300,6 +2621,7 @@ export class EvalBroker {
     const inFlight = this.resolveInFlight.get(key);
     if (inFlight) {
       const cachedResult = await inFlight;
+      this.assertRequestContextActive(context);
       if (!cachedResult.resolvedId) {
         return this.finalizeResolvedImport(importerId, specifier, {
           resolvedId: null,
@@ -2340,6 +2662,7 @@ export class EvalBroker {
           importerId,
           kind
         );
+        this.assertRequestContextActive(context);
         if (customResolved) {
           const normalized = this.normalizeResolvedId(
             customResolved.id,
@@ -2422,8 +2745,12 @@ export class EvalBroker {
       ) {
         let resolved: string | null = null;
         try {
-          resolved = await this.asyncResolve(specifier, importerId, stack);
+          const asyncResolve =
+            services.asyncResolve ?? this.fallbackAsyncResolve;
+          resolved = await asyncResolve(specifier, importerId, stack);
+          this.assertRequestContextActive(context);
         } catch {
+          this.assertRequestContextActive(context);
           resolved = null;
         }
         if (resolved) {
@@ -2482,6 +2809,7 @@ export class EvalBroker {
 
     try {
       const result = await task;
+      this.assertRequestContextActive(context);
       this.resolveCache.set(key, result);
 
       if (!result.resolvedId) {
@@ -2513,7 +2841,9 @@ export class EvalBroker {
 
       return this.finalizeResolvedImport(importerId, specifier, overridden);
     } finally {
-      this.resolveInFlight.delete(key);
+      if (this.resolveInFlight.get(key) === task) {
+        this.resolveInFlight.delete(key);
+      }
     }
   }
 
@@ -2548,7 +2878,7 @@ export class EvalBroker {
     }
     this.emittedDependencies.add(key);
 
-    this.services.eventEmitter.single({
+    this.currentServices.eventEmitter.single({
       type: 'dependency',
       file: importerId,
       only,
@@ -2574,7 +2904,7 @@ export class EvalBroker {
     resolved: string | null,
     only: string[]
   ) {
-    const importerEntrypoint = this.services.cache.get(
+    const importerEntrypoint = this.currentServices.cache.get(
       'entrypoints',
       importerId
     ) as
@@ -2610,7 +2940,7 @@ export class EvalBroker {
     const collected = new Set(
       this.runtimeDependenciesByModule.get(entrypointId) ?? []
     );
-    const cachedEntrypoint = this.services.cache.get(
+    const cachedEntrypoint = this.currentServices.cache.get(
       'entrypoints',
       entrypointId
     ) as
@@ -2647,14 +2977,14 @@ export class EvalBroker {
     importerId: string,
     stack: string[]
   ): ResolveResult {
-    const { root } = this.services.options;
+    const { root } = this.currentServices.options;
     const keyInfo = toImportKey({
       source: resolved.source,
       resolved: resolved.resolved,
       root,
     });
     const override = getImportOverride(
-      this.services.options.pluginOptions.importOverrides,
+      this.currentServices.options.pluginOptions.importOverrides,
       keyInfo.key
     );
 
@@ -2671,14 +3001,15 @@ export class EvalBroker {
     }
 
     let nextOnly = applyImportOverrideToOnly(resolved.only, override);
-    const cached = this.services.cache.get('entrypoints', nextResolved) as
-      | CachedEntrypointLike
-      | undefined;
+    const cached = this.currentServices.cache.get(
+      'entrypoints',
+      nextResolved
+    ) as CachedEntrypointLike | undefined;
     if (
       nextOnly.includes('__wywPreval') &&
       cached?.evaluated &&
       !cached.ignored &&
-      !hasCachedWywPrevalExport(this.services, nextResolved, cached)
+      !hasCachedWywPrevalExport(this.currentServices, nextResolved, cached)
     ) {
       nextOnly = nextOnly.filter((item) => item !== '__wywPreval');
     }
@@ -2700,7 +3031,7 @@ export class EvalBroker {
     kind: ResolveRequestPayload['kind']
   ): ResolveCacheEntry {
     const { conditionNames, extensions, oxcOptions } =
-      this.services.options.pluginOptions;
+      this.currentServices.options.pluginOptions;
 
     try {
       const resolved = resolveWithNativeResolver({
@@ -2744,8 +3075,8 @@ export class EvalBroker {
     resolvedId: string;
     kind: ResolveRequestPayload['kind'];
   }) {
-    const evalOptions = getEvalOptions(this.services);
-    const { root } = this.services.options;
+    const evalOptions = getEvalOptions(this.currentServices);
+    const { root } = this.currentServices.options;
     const keyInfo = toImportKey({
       source: specifier,
       resolved: resolvedId,
@@ -2753,7 +3084,7 @@ export class EvalBroker {
     });
 
     const override = getImportOverride(
-      this.services.options.pluginOptions.importOverrides,
+      this.currentServices.options.pluginOptions.importOverrides,
       keyInfo.key
     );
 
@@ -2785,7 +3116,7 @@ export class EvalBroker {
       );
     }
 
-    const warnedUnknownImports = getWarnedUnknownImports(this.services);
+    const warnedUnknownImports = getWarnedUnknownImports(this.currentServices);
     if (policy === 'warn' && !warnedUnknownImports.has(keyInfo.key)) {
       warnedUnknownImports.add(keyInfo.key);
       const warningMessage = [
@@ -2819,10 +3150,12 @@ export class EvalBroker {
   private async handleLoad(
     id: string,
     payload: LoadRequestPayload,
-    telemetry = this.activeEvalTelemetry
+    telemetry = this.activeEvalTelemetry,
+    context?: EvalRequestContext
   ) {
     telemetry?.recordLoadRequest();
-    const prepared = await this.loadModule(payload, telemetry);
+    const prepared = await this.loadModule(payload, telemetry, context);
+    this.assertRequestContextActive(context);
     const resetModule =
       prepared.resetModule === true || this.pendingModuleResets.has(payload.id);
 
@@ -2903,7 +3236,8 @@ export class EvalBroker {
 
     this.recordEvalFileDebugLine(payload, prepared, shouldShipCode);
 
-    await this.sendLoadResult(
+    await this.sendLoadResultForRequest(
+      context,
       id,
       {
         id: payload.id,
@@ -2919,6 +3253,7 @@ export class EvalBroker {
       },
       transmissionTelemetry
     );
+    this.assertRequestContextActive(context);
     if (resetModule) {
       this.pendingModuleResets.delete(payload.id);
     }
@@ -2958,10 +3293,13 @@ export class EvalBroker {
 
   private async loadModule(
     { id, importerId, request }: LoadRequestPayload,
-    telemetry = this.activeEvalTelemetry
+    telemetry = this.activeEvalTelemetry,
+    context?: EvalRequestContext
   ): Promise<PreparedCacheEntry & { resetModule?: true }> {
+    this.assertRequestContextActive(context);
+    const services = context?.services ?? this.currentServices;
     const actionEntrypoint = importerId ?? id;
-    return this.services.eventEmitter.action(
+    return services.eventEmitter.action(
       'eval:loadModule',
       `${actionEntrypoint}\0${id}`,
       actionEntrypoint,
@@ -2971,7 +3309,11 @@ export class EvalBroker {
           // Cache and serialized-export hits have no asynchronous critical
           // section. A real preparation registers itself below before this
           // call yields, so only successors need the outer strict chain.
-          return this.loadModuleImpl({ id, importerId, request }, telemetry);
+          return this.loadModuleImpl(
+            { id, importerId, request },
+            telemetry,
+            context
+          );
         }
 
         telemetry?.recordLoadCacheOutcome('inflight-wait');
@@ -2983,9 +3325,11 @@ export class EvalBroker {
             // A queued request must retry, especially when it follows an
             // invalidation that may have fixed the failed source.
           }
+          this.assertRequestContextActive(context);
           return this.loadModuleImpl(
             { id, importerId, request },
             telemetry,
+            context,
             true,
             false
           );
@@ -3003,11 +3347,14 @@ export class EvalBroker {
   private async loadModuleImpl(
     { id, importerId, request }: LoadRequestPayload,
     telemetry = this.activeEvalTelemetry,
+    context?: EvalRequestContext,
     waitedForInflight = false,
     registerPreparation = true
   ): Promise<PreparedCacheEntry & { resetModule?: true }> {
+    this.assertRequestContextActive(context);
+    const services = context?.services ?? this.currentServices;
     let cached = this.loadCache.get(id);
-    const invalidated = this.services.cache.consumeInvalidation(id);
+    const invalidated = services.cache.consumeInvalidation(id);
     if (invalidated) {
       this.pendingModuleResets.add(id);
       if (telemetry && cached) {
@@ -3051,7 +3398,7 @@ export class EvalBroker {
         }
       }
     }
-    const cachedEntrypoint = this.services.cache.get('entrypoints', id) as
+    const cachedEntrypoint = services.cache.get('entrypoints', id) as
       | {
           evaluated?: boolean;
           evaluatedOnly?: string[];
@@ -3072,7 +3419,7 @@ export class EvalBroker {
       isSuperSet(cachedEntrypoint.evaluatedOnly ?? [], requiredOnly)
     ) {
       const serializeOnly = getSerializableStaticImportKeys(
-        this.services,
+        services,
         id,
         cachedEntrypoint,
         requiredOnly,
@@ -3128,7 +3475,7 @@ export class EvalBroker {
       ? getSlowImportThresholdMs()
       : 0;
     const warnedSlowImports = slowImportWarningsEnabled
-      ? getWarnedSlowImports(this.services)
+      ? getWarnedSlowImports(services)
       : null;
     const shouldWarnSlowImport = Boolean(
       slowImportWarningsEnabled &&
@@ -3141,10 +3488,11 @@ export class EvalBroker {
     const slowImportStartedAt = shouldWarnSlowImport ? performance.now() : 0;
 
     const task = (async () => {
-      const evalOptions = getEvalOptions(this.services);
+      const evalOptions = getEvalOptions(services);
 
       if (evalOptions.customLoader) {
         const loaded = await evalOptions.customLoader(id);
+        this.assertRequestContextActive(context);
         if (loaded) {
           const code = formatLoaderResult(loaded.code, loaded.loader);
           return {
@@ -3157,12 +3505,7 @@ export class EvalBroker {
       }
 
       if (request && importerId) {
-        const loaded = loadByImportLoaders(
-          this.services,
-          request,
-          id,
-          importerId
-        );
+        const loaded = loadByImportLoaders(services, request, id, importerId);
         if (loaded.handled) {
           const code = `export default ${JSON.stringify(loaded.value)};`;
           return {
@@ -3191,7 +3534,7 @@ export class EvalBroker {
 
       if (
         extension &&
-        !this.services.options.pluginOptions.extensions.includes(extension)
+        !services.options.pluginOptions.extensions.includes(extension)
       ) {
         const code = `export default ${JSON.stringify(id)};`;
         return {
@@ -3203,7 +3546,7 @@ export class EvalBroker {
       }
 
       const directBarrelProxy = buildDirectBarrelProxy(
-        this.services,
+        services,
         id,
         requiredOnly
       );
@@ -3215,11 +3558,11 @@ export class EvalBroker {
       }
 
       if (!requiredOnly.includes('*')) {
-        const loadedAndParsed = this.services.loadAndParseFn(
-          this.services,
+        const loadedAndParsed = services.loadAndParseFn(
+          services,
           id,
           undefined,
-          this.services.log
+          services.log
         );
 
         if (
@@ -3242,13 +3585,13 @@ export class EvalBroker {
         prepared = preparationTelemetry
           ? preparationTelemetry.measureStage('prepare', () =>
               prepareModuleOnDemand(
-                this.services,
+                services,
                 id,
                 prepareOnly,
                 preparationTelemetry
               )
             )
-          : prepareModuleOnDemand(this.services, id, prepareOnly);
+          : prepareModuleOnDemand(services, id, prepareOnly);
       } catch (error) {
         preparationTelemetry?.fail();
         throw error;
@@ -3266,7 +3609,7 @@ export class EvalBroker {
       if (shouldWarnSlowImport && request && importerId) {
         const durationMs = performance.now() - slowImportStartedAt;
         if (durationMs >= slowImportThresholdMs) {
-          const { root } = this.services.options;
+          const { root } = services.options;
           const resolvedKey = stripQueryAndHash(id);
           const { key: importKey } = toImportKey({
             source: request,
@@ -3293,7 +3636,7 @@ export class EvalBroker {
               ``,
               `note: configure threshold with WYW_WARN_SLOW_IMPORTS_MS (current: ${slowImportThresholdMs}ms)`,
             ].join('\n');
-            emitWarning(this.currentServices, warning);
+            emitWarning(services, warning);
           }
         }
       }
@@ -3307,6 +3650,7 @@ export class EvalBroker {
 
     try {
       const result = await task;
+      this.assertRequestContextActive(context);
       // Register imports for ALL code paths (barrel proxy, prepareModuleOnDemand,
       // custom loaders). Without this, the barrel proxy path skips
       // ensureImportsMapping, so getLoadRequestOnly can't determine what a barrel
@@ -3341,6 +3685,36 @@ export class EvalBroker {
     }
   }
 
+  private sendLoadResultForRequest(
+    context: EvalRequestContext | undefined,
+    id: string,
+    payload: Omit<LoadResultPayload, 'chunkIndex' | 'chunkCount' | 'codeChunk'>,
+    telemetry?: LoadTransmissionTelemetry
+  ): Promise<void> {
+    if (!context) {
+      return this.sendLoadResult(id, payload, telemetry);
+    }
+    return sendEvalLoadResult(id, payload, telemetry, (message, onSerialized) =>
+      this.sendMessageForRequest(context, message, onSerialized)
+    );
+  }
+
+  private sendMessageForRequest(
+    context: EvalRequestContext | undefined,
+    message: MainToRunnerMessage,
+    onSerialized?: (bytes: number) => void
+  ): Promise<void> {
+    if (!context) {
+      return this.sendMessage(message, onSerialized);
+    }
+    this.assertRequestContextActive(context);
+    return sendEvalMessage(
+      context?.inputQueue ?? this.runnerInputQueue,
+      message,
+      onSerialized
+    );
+  }
+
   private sendLoadResult(
     id: string,
     payload: Omit<LoadResultPayload, 'chunkIndex' | 'chunkCount' | 'codeChunk'>,
@@ -3356,7 +3730,11 @@ export class EvalBroker {
     return sendEvalMessage(this.runnerInputQueue, message, onSerialized);
   }
 
-  private handleSendMessageError(error: unknown, id?: string) {
+  private handleSendMessageError(
+    error: unknown,
+    id?: string,
+    runner: ChildProcessWithoutNullStreams | null = this.runner
+  ) {
     const serialized =
       error instanceof Error
         ? { message: error.message, stack: error.stack }
@@ -3366,8 +3744,13 @@ export class EvalBroker {
       this.rejectPending(id, serialized);
     }
 
-    this.recordBrokerLifecycle('runner-stop-requested', 'send-error', true);
-    this.runner?.kill();
+    if (runner) {
+      this.retireRunner(
+        runner,
+        'send-error',
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
   }
 
   private request<TPayload>(
@@ -3382,20 +3765,18 @@ export class EvalBroker {
       id,
       payload: payload as never,
     } as MainToRunnerMessage;
+    const requestRunner = this.runner;
 
     return new Promise<TPayload>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        this.recordBrokerLifecycle(
-          'runner-stop-requested',
-          `request-timeout:${type}`,
-          true
-        );
-        this.runner?.kill();
         const error = new Error(
           `[wyw-in-js] Eval runner timed out for ${type}`
         );
         (error as { code?: string }).code = 'WYW_EVAL_TIMEOUT';
+        if (requestRunner) {
+          this.retireRunner(requestRunner, `request-timeout:${type}`, error);
+        }
         reject(error);
       }, timeoutMs);
 
@@ -3406,7 +3787,7 @@ export class EvalBroker {
       });
 
       this.sendMessage(message).catch((error) =>
-        this.handleSendMessageError(error, id)
+        this.handleSendMessageError(error, id, requestRunner)
       );
     });
   }
@@ -3460,7 +3841,7 @@ export class EvalBroker {
     }
 
     let mergedOnly = storedOnly;
-    for (const cachedEntrypoint of this.services.cache.entrypoints.values() as Iterable<CachedDependencyOwner>) {
+    for (const cachedEntrypoint of this.currentServices.cache.entrypoints.values() as Iterable<CachedDependencyOwner>) {
       // Scope the union to entrypoints that are part of the CURRENT
       // session's link graph. Cached entrypoints from prior transforms
       // already evaluated against their own VMs; their imports must not
@@ -3495,16 +3876,19 @@ export class EvalBroker {
   }
 }
 
-const evalBrokers = new WeakMap<
-  Services['cache'],
-  { key: string; broker: EvalBroker }
->();
+const evalBrokers = new WeakMap<object, { key: string; broker: EvalBroker }>();
 
-export const disposeEvalBroker = (cache: Services['cache']) => {
-  const cached = evalBrokers.get(cache);
+const missingScopedAsyncResolve = async (): Promise<null> => {
+  throw new Error(
+    '[wyw-in-js] A scoped eval broker requires a per-session async resolver'
+  );
+};
+
+export const disposeEvalBroker = (scope: object) => {
+  const cached = evalBrokers.get(scope);
   if (!cached) return;
   cached.broker.dispose('registry-dispose');
-  evalBrokers.delete(cache);
+  evalBrokers.delete(scope);
 };
 
 export const getEvalBroker = (
@@ -3516,22 +3900,33 @@ export const getEvalBroker = (
   ) => Promise<string | null>,
   cacheKey: string
 ) => {
-  const cached = evalBrokers.get(services.cache);
-  if (cached && cached.key === cacheKey) {
+  const scope = services.evalBrokerScope ?? services.cache;
+  let cached = evalBrokers.get(scope);
+  if (cached?.broker.isDisposed) {
+    evalBrokers.delete(scope);
+    cached = undefined;
+  }
+  if (cached) {
     if (hasEvalTelemetryReporter(services.eventEmitter)) {
       recordEvalBrokerLifecycle(services.eventEmitter, cached.broker, () => ({
         event: 'broker-reused',
-        reason: 'stable-cache-key',
+        reason:
+          cached.key === cacheKey ? 'stable-cache-key' : 'shared-runner-scope',
       }));
     }
+    cached.key = cacheKey;
     return cached.broker;
   }
 
-  if (cached) {
-    cached.broker.dispose('cache-key-change');
-    evalBrokers.delete(services.cache);
-  }
-  const broker = new EvalBroker(services, asyncResolve);
-  evalBrokers.set(services.cache, { key: cacheKey, broker });
+  // A shared process scope can outlive the loader invocation that creates it.
+  // Never retain that invocation's resolver closure (and its LoaderContext)
+  // as the broker's permanent fallback; every configured transform supplies
+  // its resolver through the current Services object.
+  const broker = new EvalBroker(
+    services,
+    services.evalBrokerScope ? missingScopedAsyncResolve : asyncResolve,
+    Boolean(services.evalBrokerScope)
+  );
+  evalBrokers.set(scope, { key: cacheKey, broker });
   return broker;
 };

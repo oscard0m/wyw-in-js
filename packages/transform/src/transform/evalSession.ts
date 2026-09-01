@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import path from 'path';
 
 import type { StrictOptions } from '@wyw-in-js/shared';
 
@@ -57,7 +58,8 @@ export const getEvalCacheKey = (
   pluginOptions: StrictOptions,
   asyncResolveKey: string | undefined,
   asyncResolve: AsyncResolve,
-  loadDependencyCode?: Services['loadDependencyCode']
+  loadDependencyCode?: Services['loadDependencyCode'],
+  root?: string
 ) => {
   const evalOptions = pluginOptions.eval ?? {};
   const payload = JSON.stringify({
@@ -78,6 +80,7 @@ export const getEvalCacheKey = (
     importOverrides: pluginOptions.importOverrides ?? null,
     extensions: pluginOptions.extensions,
     features: pluginOptions.features,
+    root: root ? path.resolve(root) : null,
   });
 
   return createHash('sha256').update(payload).digest('hex');
@@ -92,7 +95,8 @@ export const configureEvalSession = (
     pluginOptions,
     services.asyncResolveKey,
     asyncResolve,
-    services.loadDependencyCode
+    services.loadDependencyCode,
+    services.options.root
   );
 
   services.cache.setKeySalt(evalCacheKey);
@@ -100,6 +104,8 @@ export const configureEvalSession = (
   // eval-specific session state behind the evalSession module boundary.
   // eslint-disable-next-line no-param-reassign
   services.asyncResolve = asyncResolve;
+  // eslint-disable-next-line no-param-reassign
+  services.evalCacheKey = evalCacheKey;
   // eslint-disable-next-line no-param-reassign
   services.evalBroker = getEvalBroker(services, asyncResolve, evalCacheKey);
 

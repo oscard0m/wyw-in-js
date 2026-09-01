@@ -36,68 +36,54 @@ export type LoaderOptions = {
   keepComments?: boolean;
   outputCss?: boolean;
   prefixer?: boolean;
+  /**
+   * Reuse transform and eval state across loader invocations which are known
+   * to have identical transform and eval semantics. Every output-affecting
+   * option, alias, condition, and compilation graph must match. Keys are kept
+   * for the loader module's lifetime, so use a finite, stable set of values.
+   */
+  resolverScopeKey?: string;
   sourceMap?: boolean;
 } & Partial<PluginOptions>;
 
 type Loader = RawLoaderDefinitionFunction<LoaderOptions>;
 type ResolveFn = ReturnType<LoaderContext<LoaderOptions>['getResolve']>;
 
-type Resolver = (
-  what: string,
-  importer: string,
-  stack?: string[]
-) => Promise<string>;
-
-const cache = new TransformCacheCollection();
-
-// Stable resolver scope shared by every loader invocation in this process,
-// mirroring webpack-loader's per-compiler ResolverScope. The eval broker and
-// its runner child process are keyed on `asyncResolveKey`; passing a fresh
-// per-file closure to transform() without a key would rotate that key every
-// file and force a runner respawn per transformed file. Each invocation
-// registers its own resolver here (keyed by resourcePath) so eval-time
-// resolutions still hit the loader context of the file being transformed.
-const ASYNC_RESOLVE_KEY = 'turbopack-loader';
-// Keyed by resourcePath only. Unlike webpack-loader there is no compiler
-// handle to scope by, so two concurrent compilations transforming the same
-// file (e.g. Next.js server and client) overwrite each other's entry and a
-// resolution may be routed through the other compilation's loader context.
-// Entries are removed when their loader invocation settles (see the
-// transform() finally below); webpack-loader instead clears its map on
-// compiler done/failed hooks, which Turbopack does not expose.
-const resolvers = new Map<string, Resolver>();
-
-const getResolverKey = (importer: string, stack: string[]): string => {
-  const root = stack.length ? stack[stack.length - 1] : importer;
-  return stripQueryAndHash(root);
+type TransformScope = {
+  asyncResolveKey: string;
+  cache: TransformCacheCollection;
 };
 
-const scopedAsyncResolve: Resolver = (what, importer, stack = [importer]) => {
-  const resolverKeys = [
-    getResolverKey(importer, stack),
-    stripQueryAndHash(importer),
-  ].filter((candidate, idx, all) => all.indexOf(candidate) === idx);
+let resolverScopeId = 0;
+const sharedResolverScopes = new Map<string, TransformScope>();
 
-  const selectedResolvers = resolverKeys
-    .map((resolverKey) => resolvers.get(resolverKey))
-    .filter((resolver): resolver is Resolver => Boolean(resolver));
+// Turbopack exposes a fresh resolver closure for every loader call, but no
+// compiler/compilation identity. Keep the expensive child process alive at
+// this module's lifetime while the transform package isolates each semantic
+// resolver session inside that process.
+const evalBrokerScope = {};
 
-  if (selectedResolvers.length === 0) {
-    throw new Error('No resolver found');
+const createTransformScope = (): TransformScope => {
+  resolverScopeId += 1;
+  return {
+    asyncResolveKey: `turbopack:${resolverScopeId}`,
+    cache: new TransformCacheCollection(),
+  };
+};
+
+const getTransformScope = (scopeKey: string | undefined) => {
+  if (scopeKey === undefined) {
+    return createTransformScope();
   }
 
-  // Root and importer resolver side effects both matter for dependency
-  // tracking, so keep them aligned and verify they agree on the answer.
-  return Promise.all(
-    selectedResolvers.map((resolver) => resolver(what, importer, stack))
-  ).then((results) => {
-    const firstResult = results[0];
-    if (results.some((result) => result !== firstResult)) {
-      throw new Error('Resolvers returned different results');
-    }
+  const cached = sharedResolverScopes.get(scopeKey);
+  if (cached) {
+    return cached;
+  }
 
-    return firstResult;
-  });
+  const scope = createTransformScope();
+  sharedResolverScopes.set(scopeKey, scope);
+  return scope;
 };
 
 function convertSourceMap(
@@ -169,9 +155,18 @@ const turbopackLoader: Loader = function turbopackLoader(
     outputCss,
     cssOutputMode = 'sidecar',
     prefixer,
+    resolverScopeKey,
     configFile,
     ...rest
   } = this.getOptions() || {};
+
+  if (
+    resolverScopeKey !== undefined &&
+    (typeof resolverScopeKey !== 'string' || resolverScopeKey.length === 0)
+  ) {
+    callback(new Error('resolverScopeKey must be a non-empty string'));
+    return;
+  }
 
   if (configFile) {
     const configPath = path.isAbsolute(configFile)
@@ -209,8 +204,7 @@ const turbopackLoader: Loader = function turbopackLoader(
     return result;
   };
 
-  const resolverKey = stripQueryAndHash(this.resourcePath);
-  resolvers.set(resolverKey, asyncResolve);
+  const transformScope = getTransformScope(resolverScopeKey);
 
   const addResolvedDependency = async (
     dependency: string,
@@ -237,8 +231,9 @@ const turbopackLoader: Loader = function turbopackLoader(
       keepComments,
       root: process.cwd(),
     },
-    asyncResolveKey: ASYNC_RESOLVE_KEY,
-    cache,
+    asyncResolveKey: transformScope.asyncResolveKey,
+    cache: transformScope.cache,
+    evalBrokerScope,
     emitWarning: (message: string) => {
       if (typeof this.emitWarning === 'function') {
         const warning = new Error(message);
@@ -248,7 +243,7 @@ const turbopackLoader: Loader = function turbopackLoader(
     },
   };
 
-  transform(transformServices, content.toString(), scopedAsyncResolve)
+  transform(transformServices, content.toString(), asyncResolve)
     .then(async (result: Result) => {
       const rawCssText = result.cssText ?? '';
 
@@ -304,18 +299,7 @@ const turbopackLoader: Loader = function turbopackLoader(
 
       callback(null, result.code, result.sourceMap ?? undefined);
     })
-    .catch((err: Error) => callback(err))
-    .finally(() => {
-      // The closure retains `this` (the whole LoaderContext); keeping it past
-      // the invocation would grow the map unboundedly in watch mode. Evals
-      // rooted in other files lose this file as an importer-side fallback,
-      // which only skips duplicate dependency tracking on a loader run that
-      // has already completed. The identity check keeps a concurrent
-      // invocation for the same path (e.g. the css query pass) intact.
-      if (resolvers.get(resolverKey) === asyncResolve) {
-        resolvers.delete(resolverKey);
-      }
-    });
+    .catch((err: Error) => callback(err));
 };
 
 export default turbopackLoader;
