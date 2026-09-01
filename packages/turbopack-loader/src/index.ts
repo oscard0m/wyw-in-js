@@ -42,7 +42,63 @@ export type LoaderOptions = {
 type Loader = RawLoaderDefinitionFunction<LoaderOptions>;
 type ResolveFn = ReturnType<LoaderContext<LoaderOptions>['getResolve']>;
 
+type Resolver = (
+  what: string,
+  importer: string,
+  stack?: string[]
+) => Promise<string>;
+
 const cache = new TransformCacheCollection();
+
+// Stable resolver scope shared by every loader invocation in this process,
+// mirroring webpack-loader's per-compiler ResolverScope. The eval broker and
+// its runner child process are keyed on `asyncResolveKey`; passing a fresh
+// per-file closure to transform() without a key would rotate that key every
+// file and force a runner respawn per transformed file. Each invocation
+// registers its own resolver here (keyed by resourcePath) so eval-time
+// resolutions still hit the loader context of the file being transformed.
+const ASYNC_RESOLVE_KEY = 'turbopack-loader';
+// Keyed by resourcePath only. Unlike webpack-loader there is no compiler
+// handle to scope by, so two concurrent compilations transforming the same
+// file (e.g. Next.js server and client) overwrite each other's entry and a
+// resolution may be routed through the other compilation's loader context.
+// Entries are removed when their loader invocation settles (see the
+// transform() finally below); webpack-loader instead clears its map on
+// compiler done/failed hooks, which Turbopack does not expose.
+const resolvers = new Map<string, Resolver>();
+
+const getResolverKey = (importer: string, stack: string[]): string => {
+  const root = stack.length ? stack[stack.length - 1] : importer;
+  return stripQueryAndHash(root);
+};
+
+const scopedAsyncResolve: Resolver = (what, importer, stack = [importer]) => {
+  const resolverKeys = [
+    getResolverKey(importer, stack),
+    stripQueryAndHash(importer),
+  ].filter((candidate, idx, all) => all.indexOf(candidate) === idx);
+
+  const selectedResolvers = resolverKeys
+    .map((resolverKey) => resolvers.get(resolverKey))
+    .filter((resolver): resolver is Resolver => Boolean(resolver));
+
+  if (selectedResolvers.length === 0) {
+    throw new Error('No resolver found');
+  }
+
+  // Root and importer resolver side effects both matter for dependency
+  // tracking, so keep them aligned and verify they agree on the answer.
+  return Promise.all(
+    selectedResolvers.map((resolver) => resolver(what, importer, stack))
+  ).then((results) => {
+    const firstResult = results[0];
+    if (results.some((result) => result !== firstResult)) {
+      throw new Error('Resolvers returned different results');
+    }
+
+    return firstResult;
+  });
+};
 
 function convertSourceMap(
   value: RawSourceMap | string | null | undefined,
@@ -134,9 +190,10 @@ const turbopackLoader: Loader = function turbopackLoader(
   const resolveModule = this.getResolve({ dependencyType: 'esm' });
 
   const asyncResolve = async (token: string, importer: string) => {
-    const context = path.isAbsolute(importer)
-      ? path.dirname(importer)
-      : path.join(process.cwd(), path.dirname(importer));
+    const importerPath = stripQueryAndHash(importer);
+    const context = path.isAbsolute(importerPath)
+      ? path.dirname(importerPath)
+      : path.join(process.cwd(), path.dirname(importerPath));
 
     const result = await resolveWith(resolveModule, context, token);
 
@@ -151,6 +208,9 @@ const turbopackLoader: Loader = function turbopackLoader(
 
     return result;
   };
+
+  const resolverKey = stripQueryAndHash(this.resourcePath);
+  resolvers.set(resolverKey, asyncResolve);
 
   const addResolvedDependency = async (
     dependency: string,
@@ -177,6 +237,7 @@ const turbopackLoader: Loader = function turbopackLoader(
       keepComments,
       root: process.cwd(),
     },
+    asyncResolveKey: ASYNC_RESOLVE_KEY,
     cache,
     emitWarning: (message: string) => {
       if (typeof this.emitWarning === 'function') {
@@ -187,7 +248,7 @@ const turbopackLoader: Loader = function turbopackLoader(
     },
   };
 
-  transform(transformServices, content.toString(), asyncResolve)
+  transform(transformServices, content.toString(), scopedAsyncResolve)
     .then(async (result: Result) => {
       const rawCssText = result.cssText ?? '';
 
@@ -243,7 +304,18 @@ const turbopackLoader: Loader = function turbopackLoader(
 
       callback(null, result.code, result.sourceMap ?? undefined);
     })
-    .catch((err: Error) => callback(err));
+    .catch((err: Error) => callback(err))
+    .finally(() => {
+      // The closure retains `this` (the whole LoaderContext); keeping it past
+      // the invocation would grow the map unboundedly in watch mode. Evals
+      // rooted in other files lose this file as an importer-side fallback,
+      // which only skips duplicate dependency tracking on a loader run that
+      // has already completed. The identity check keeps a concurrent
+      // invocation for the same path (e.g. the css query pass) intact.
+      if (resolvers.get(resolverKey) === asyncResolve) {
+        resolvers.delete(resolverKey);
+      }
+    });
 };
 
 export default turbopackLoader;
