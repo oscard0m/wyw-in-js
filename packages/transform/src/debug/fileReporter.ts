@@ -15,6 +15,10 @@ import {
   PIPELINE_TELEMETRY_SCHEMA,
   registerPipelineTelemetryJSONlReporter,
 } from './pipelineTelemetry';
+import {
+  EVAL_TELEMETRY_SCHEMA,
+  registerEvalTelemetryJSONlReporter,
+} from './evalTelemetry';
 
 type Timings = Map<string, Map<string, number>>;
 
@@ -101,9 +105,9 @@ const writeJSONl = (stream: NodeJS.WritableStream, data: unknown) => {
   stream.write(`${JSON.stringify(data, replacer)}\n`);
 };
 
-const PIPELINE_TELEMETRY_WRITE_CHUNK_CHARS = 256 * 1024;
+const TELEMETRY_WRITE_CHUNK_CHARS = 256 * 1024;
 
-const createPipelineTelemetryJSONlWriter = (stream: NodeJS.WritableStream) => {
+const createTelemetryJSONlWriter = (stream: NodeJS.WritableStream) => {
   let bufferedChars = 0;
   let bufferedLines: string[] = [];
   let closed = false;
@@ -133,7 +137,7 @@ const createPipelineTelemetryJSONlWriter = (stream: NodeJS.WritableStream) => {
       if (closed || !stream.writable) return;
       bufferedLines.push(line);
       bufferedChars += line.length;
-      if (bufferedChars >= PIPELINE_TELEMETRY_WRITE_CHUNK_CHARS) flush();
+      if (bufferedChars >= TELEMETRY_WRITE_CHUNK_CHARS) flush();
     },
   };
 };
@@ -234,10 +238,17 @@ export const createFileReporter = (
     options.dir,
     'pipeline-telemetry.jsonl'
   );
-  const pipelineTelemetryWriter = createPipelineTelemetryJSONlWriter(
+  const pipelineTelemetryWriter = createTelemetryJSONlWriter(
     pipelineTelemetryStream
   );
   writeJSONl(pipelineTelemetryStream, PIPELINE_TELEMETRY_SCHEMA);
+
+  const evalTelemetryStream = createReportStream(
+    options.dir,
+    'eval-telemetry.jsonl'
+  );
+  const evalTelemetryWriter = createTelemetryJSONlWriter(evalTelemetryStream);
+  writeJSONl(evalTelemetryStream, EVAL_TELEMETRY_SCHEMA);
 
   const startedAt = performance.now();
   const timings: Timings = new Map();
@@ -370,6 +381,16 @@ export const createFileReporter = (
       if (status === 'error') pipelineTelemetryWriter.flush();
     }
   );
+  let unregisterEvalTelemetry = registerEvalTelemetryJSONlReporter(
+    emitter,
+    workingDir,
+    (line, record) => {
+      evalTelemetryWriter.write(line);
+      if (record.type === 'eval-root' && record.root.status === 'error') {
+        evalTelemetryWriter.flush();
+      }
+    }
+  );
   let done = false;
 
   return {
@@ -380,6 +401,9 @@ export const createFileReporter = (
       unregisterPipelineTelemetry();
       unregisterPipelineTelemetry = () => {};
       pipelineTelemetryWriter.end();
+      unregisterEvalTelemetry();
+      unregisterEvalTelemetry = () => {};
+      evalTelemetryWriter.end();
 
       if (options.print) {
         printTimings(timings, startedAt, sourceRoot);
@@ -396,6 +420,7 @@ export const createFileReporter = (
         perfSpanStream,
         evalFilesStream,
         pipelineTelemetryStream,
+        evalTelemetryStream,
       ].forEach((stream) => {
         if (stream.writable) {
           stream.end();

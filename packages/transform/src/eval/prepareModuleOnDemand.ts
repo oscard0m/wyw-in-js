@@ -3,6 +3,7 @@ import type { Services } from '../transform/types';
 import { Entrypoint } from '../transform/Entrypoint';
 import { collectOxcImportMap } from '../utils/oxcImportMap';
 import { prepareCodeForEvalRuntime } from '../transform/generators/transform';
+import type { EvalPreparationToken } from '../debug/evalTelemetry.types';
 
 export type PreparedModule = {
   code: string;
@@ -13,7 +14,8 @@ export type PreparedModule = {
 export function prepareModuleOnDemand(
   services: Services,
   id: string,
-  only: string[]
+  only: string[],
+  telemetry?: EvalPreparationToken
 ): PreparedModule {
   const entrypoint = Entrypoint.createRoot(services, id, only, undefined, {
     mergeCachedOnly: !only.includes('__wywPreval'),
@@ -50,7 +52,12 @@ export function prepareModuleOnDemand(
       : (entrypoint.loadedAndParsed.ast as Parameters<
           typeof prepareCodeForEvalRuntime
         >[2]);
-  const [code, imports] = prepareCodeForEvalRuntime(services, entrypoint, ast);
+  const [code, imports] = prepareCodeForEvalRuntime(
+    services,
+    entrypoint,
+    ast,
+    telemetry
+  );
 
   return {
     code,

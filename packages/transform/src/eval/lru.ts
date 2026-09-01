@@ -7,6 +7,14 @@ export class LruCache<K, V> {
     this.maxSize = Math.max(1, maxSize);
   }
 
+  public get size(): number {
+    return this.map.size;
+  }
+
+  public peek(key: K): V | undefined {
+    return this.map.get(key);
+  }
+
   public get(key: K): V | undefined {
     const value = this.map.get(key);
     if (value === undefined) return undefined;
@@ -16,7 +24,11 @@ export class LruCache<K, V> {
     return value;
   }
 
-  public set(key: K, value: V): void {
+  public set(
+    key: K,
+    value: V,
+    onEvict?: (evictedKey: K, evictedValue: V) => void
+  ): void {
     if (this.map.has(key)) {
       this.map.delete(key);
     }
@@ -26,7 +38,9 @@ export class LruCache<K, V> {
     if (this.map.size > this.maxSize) {
       const firstKey = this.map.keys().next().value as K | undefined;
       if (firstKey !== undefined) {
+        const evictedValue = this.map.get(firstKey)!;
         this.map.delete(firstKey);
+        onEvict?.(firstKey, evictedValue);
       }
     }
   }

@@ -28,6 +28,7 @@ import {
   finishPipelineShake,
   recordPipelineLateNoMetadata,
 } from '../../debug/pipelineTelemetry';
+import type { EvalPreparationToken } from '../../debug/evalTelemetry.types';
 
 const EMPTY_FILE = '=== empty file ===';
 
@@ -85,6 +86,7 @@ export const emitCurrentStaticPlanDebug = (
 
 type PrepareCodeOptions = {
   emitCommonJS?: boolean;
+  evalTelemetry?: EvalPreparationToken;
   shortCircuitOnMissingMetadata?: boolean;
   stripForEvalRuntime?: boolean;
 };
@@ -217,7 +219,12 @@ const prepareOxcCodeImpl = (
   ) {
     log('[evaluator:end] no metadata');
     recordPipelineLateNoMetadata(filename, only, 'preeval');
-    const strippedCode = stripTypesAndJsxWithOxc(preevalCode, filename).code;
+    const strippedCode = options.evalTelemetry
+      ? options.evalTelemetry.measureStage(
+          'strip',
+          () => stripTypesAndJsxWithOxc(preevalCode, filename).code
+        )
+      : stripTypesAndJsxWithOxc(preevalCode, filename).code;
 
     return [
       normalizeOxcPreparedESM(strippedCode),
@@ -237,22 +244,42 @@ const prepareOxcCodeImpl = (
   );
   let shaken: ReturnType<typeof shakeOxcToESM>;
   if (!shakeToken) {
-    shaken = eventEmitter.perf('transform:evaluator', () =>
-      shakeOxcToESM(preevalCode, filename, {
-        importOverrides: pluginOptions.importOverrides,
-        onlyExports: only,
-        root,
-      })
-    );
+    shaken = options.evalTelemetry
+      ? options.evalTelemetry.measureStage('shake', () =>
+          eventEmitter.perf('transform:evaluator', () =>
+            shakeOxcToESM(preevalCode, filename, {
+              importOverrides: pluginOptions.importOverrides,
+              onlyExports: only,
+              root,
+            })
+          )
+        )
+      : eventEmitter.perf('transform:evaluator', () =>
+          shakeOxcToESM(preevalCode, filename, {
+            importOverrides: pluginOptions.importOverrides,
+            onlyExports: only,
+            root,
+          })
+        );
   } else {
     try {
-      shaken = eventEmitter.perf('transform:evaluator', () =>
-        shakeOxcToESM(preevalCode, filename, {
-          importOverrides: pluginOptions.importOverrides,
-          onlyExports: only,
-          root,
-        })
-      );
+      shaken = options.evalTelemetry
+        ? options.evalTelemetry.measureStage('shake', () =>
+            eventEmitter.perf('transform:evaluator', () =>
+              shakeOxcToESM(preevalCode, filename, {
+                importOverrides: pluginOptions.importOverrides,
+                onlyExports: only,
+                root,
+              })
+            )
+          )
+        : eventEmitter.perf('transform:evaluator', () =>
+            shakeOxcToESM(preevalCode, filename, {
+              importOverrides: pluginOptions.importOverrides,
+              onlyExports: only,
+              root,
+            })
+          );
       finishPipelineShake(shakeToken, shaken.code, false);
     } catch (error) {
       finishPipelineShake(shakeToken, null, true);
@@ -263,9 +290,15 @@ const prepareOxcCodeImpl = (
   log('[evaluator:end]');
 
   if (!options.emitCommonJS) {
-    const preparedCode = options.stripForEvalRuntime
-      ? stripTypesAndJsxWithOxc(shaken.code, filename).code
-      : shaken.code;
+    let preparedCode = shaken.code;
+    if (options.stripForEvalRuntime) {
+      preparedCode = options.evalTelemetry
+        ? options.evalTelemetry.measureStage(
+            'strip',
+            () => stripTypesAndJsxWithOxc(shaken.code, filename).code
+          )
+        : stripTypesAndJsxWithOxc(shaken.code, filename).code;
+    }
 
     return [
       normalizeOxcPreparedESM(preparedCode),
@@ -314,9 +347,11 @@ export const prepareCode = (
 export const prepareCodeForEvalRuntime = (
   services: Services,
   item: Entrypoint,
-  originalAst: unknown | null
+  originalAst: unknown | null,
+  evalTelemetry?: EvalPreparationToken
 ): ReturnType<PrepareCodeFn> =>
   prepareCodeImpl(services, item, originalAst, {
+    evalTelemetry,
     shortCircuitOnMissingMetadata: true,
     stripForEvalRuntime: true,
   });

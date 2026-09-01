@@ -3,6 +3,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { createFileReporter } from '../debug/fileReporter';
+import { beginEvalTelemetry } from '../debug/evalTelemetry';
 import {
   beginPipelineShake,
   finishPipelineShake,
@@ -271,6 +272,90 @@ describe('createFileReporter', () => {
         ],
       ]);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes eval telemetry schema and flushes an error root immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wyw-file-reporter-'));
+    const reporter = createFileReporter({ dir });
+    const broker = {};
+    const target = join(dir, 'eval-telemetry.jsonl');
+
+    try {
+      const failed = beginEvalTelemetry(reporter.emitter, broker, () => ({
+        entrypoint: join(dir, 'failed-root.ts'),
+      }));
+      expect(failed).toBeDefined();
+      failed!.start({ batchIndex: 0, batchSize: 1 });
+      failed!.recordLoadRequest();
+      failed!.recordLoadCacheOutcome('miss');
+      const preparation = failed!.beginPreparation(join(dir, 'dep.ts'), [
+        'value',
+      ]);
+      preparation.finish({
+        code: 'export const value = "λ";',
+        imports: null,
+        only: ['value'],
+        outputRevision: 'prepared-hash',
+      });
+      failed!.finish('error');
+
+      await waitFor(() => hasJsonlLines(target, 2));
+
+      const succeeded = beginEvalTelemetry(reporter.emitter, broker, () => ({
+        entrypoint: join(dir, 'cached-root.ts'),
+      }));
+      expect(succeeded).toBeDefined();
+      succeeded!.start({ batchIndex: 0, batchSize: 1 });
+      succeeded!.recordLoadRequest();
+      succeeded!.recordLoadCacheOutcome('hit');
+      succeeded!.finish('success');
+
+      reporter.onDone(dir);
+      reporter.onDone(dir);
+      await waitFor(() => hasJsonlLines(target, 3));
+
+      const events = readJsonl(target);
+      expect(events).toHaveLength(3);
+      expect(events[0]).toEqual(
+        expect.objectContaining({
+          denominators: expect.any(Object),
+          limitations: expect.any(Object),
+          schemaVersion: 1,
+          type: 'eval-telemetry-schema',
+        })
+      );
+      expect(events[1]).toEqual(
+        expect.objectContaining({
+          loads: expect.objectContaining({
+            cache: expect.objectContaining({ misses: 1 }),
+            preparation: expect.objectContaining({ calls: 1 }),
+            requests: 1,
+          }),
+          root: expect.objectContaining({
+            entrypoint: 'failed-root.ts',
+            status: 'error',
+          }),
+          type: 'eval-root',
+        })
+      );
+      expect(events[1].loads.preparation.artifacts[0].id).toBe('dep.ts');
+      expect(events[2]).toEqual(
+        expect.objectContaining({
+          loads: expect.objectContaining({
+            cache: expect.objectContaining({ hits: 1 }),
+            requests: 1,
+          }),
+          root: expect.objectContaining({
+            entrypoint: 'cached-root.ts',
+            status: 'success',
+          }),
+          type: 'eval-root',
+        })
+      );
+    } finally {
+      reporter.onDone(dir);
       rmSync(dir, { recursive: true, force: true });
     }
   });

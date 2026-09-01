@@ -4945,7 +4945,7 @@ describe('EvalBroker', () => {
       initRunner: (entrypoint: Entrypoint) => Promise<void>;
       lastInitKey: string | null;
       lastHappyDomEnabled: boolean;
-      lastSentLoadByModule: Map<string, { hash: string; only: string[] }>;
+      loadMirror: { snapshot: () => { entries: number } };
       onlyByModule: Map<string, string[]>;
       request: (
         type: string,
@@ -4998,7 +4998,7 @@ describe('EvalBroker', () => {
     // Switch to a different entrypoint — initKey changes but globals/happyDOM
     // are identical, so the runner keeps moduleCache and our mirror must too.
     await privateBroker.initRunner(entrypointB);
-    expect(privateBroker.lastSentLoadByModule.size).toBeGreaterThan(0);
+    expect(privateBroker.loadMirror.snapshot().entries).toBeGreaterThan(0);
 
     await privateBroker.handleLoad('msg-2', {
       id: dep,

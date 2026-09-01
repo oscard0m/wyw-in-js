@@ -1,0 +1,50 @@
+import {
+  EVAL_PREPARATION_ARTIFACT_LIMIT,
+  EVAL_TELEMETRY_SCHEMA_VERSION,
+} from './evalTelemetry.types';
+
+const deepFreeze = <T>(value: T): T => {
+  if (value && typeof value === 'object') {
+    Object.values(value).forEach(deepFreeze);
+    Object.freeze(value);
+  }
+  return value;
+};
+
+export const EVAL_TELEMETRY_SCHEMA = deepFreeze({
+  artifacts: {
+    limit: EVAL_PREPARATION_ARTIFACT_LIMIT,
+    overflow:
+      'droppedArtifacts counts preparation attempts whose new (id, outputRevision, onlyShape) bucket is omitted after the bound; aggregate totals still include them',
+  },
+  denominators: {
+    cache:
+      'loads.requests counts runner LOAD requests attributed to the root. hits + misses + serializedExports partitions terminal host preparation decisions when callers record one terminal outcome per request. inflight-wait and inflight-wait-miss are orthogonal wait events; inflight-hit is a terminal hit. promotions and invalidationMisses are subsets of misses.',
+    evictions:
+      'hostPreparedCache counts exact broker-process prepared-cache removals. brokerObservedResetSignals and brokerObservedPoison* count only existing runner signals observed by the broker. primaryPressureProxy and variantPressureProxy count exact broker shipment hash changes classified by the new result storage shape; they are churn proxies, never claims about runner eviction or capacity.',
+    lifecycle:
+      'events are observations made while this reporter registration is active. brokerId starts at 1 for each registration. restartInferred is true only on the second and later runner-activated event for the same brokerId.',
+    preparation:
+      'calls are physical prepareModuleOnDemand attempts; custom-loader, import-loader, JSON, extension-stub, direct-barrel, serialized-export, and cache-hit paths do not begin preparation. prepareMs measures the end-to-end wrapper and includes nested shake/strip time, so stage durations are not additive. durationMs covers beginPreparation to finish/fail. artifact details aggregate by (id, outputRevision, onlyShape).',
+    root: 'one record is emitted for each begun token that finishes while its reporter registration remains active. queueWaitMs is beginEvalTelemetry to start; durationMs is start to finish.',
+    transmission:
+      'logicalResults counts complete logical LOAD_RESULT responses and partitions into initial + omissions + resends + serializedExports + errors. incompleteResults counts responses whose write failed and is excluded from logicalResults. chunks counts successfully written physical messages carrying codeChunk; chunkedResults counts complete logical responses with chunks. wireMessages and wireBytes count successfully written, already serialized physical messages; telemetry must not serialize transport again.',
+  },
+  encodings: {
+    bytes: 'UTF-8 byte length',
+    filenames:
+      'relative to the reporter working directory; file URLs and absolute paths embedded in virtual IDs follow the same policy; paths outside it and cross-volume paths fall back to basename',
+    importMap:
+      'UTF-8 bytes of JSON.stringify over specifier-sorted tuples whose requested names are deduplicated and sorted',
+    onlyShape:
+      'empty for [], wildcard for any list containing *, otherwise named',
+  },
+  limitations: {
+    attribution:
+      'runner LOAD messages are attributed to the serial root active when the broker receives them. The protocol carries no root id, so a late unawaited LOAD that overlaps a later root cannot be distinguished and may be attributed to that later root; messages received with no active root are omitted',
+    runnerState:
+      'actual runner cache entries, bytes, primary LRU eviction, and variant-limit eviction are unavailable without a runner protocol signal; mirror and pressure fields are explicitly host-observed or inferred proxies',
+  },
+  schemaVersion: EVAL_TELEMETRY_SCHEMA_VERSION,
+  type: 'eval-telemetry-schema' as const,
+});
