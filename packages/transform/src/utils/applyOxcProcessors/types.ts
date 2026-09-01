@@ -8,6 +8,7 @@ import type {
 } from 'oxc-parser';
 
 import type {
+  OxcPureCallHint,
   OxcStaticValue,
   OxcStaticValueCandidate,
 } from '../collectOxcTemplateDependencies';
@@ -54,6 +55,7 @@ export type ApplyOxcProcessorsResult = {
   // the runtime value of the binding IS this string.
   processorClassNamesByLocal: Map<string, string>;
   processors: BaseProcessor[];
+  pureCallHints: OxcPureCallHint[];
   runtimeProcessorPlan?: OxcProcessorAnalysisPlan;
   staticPlanFacts: StaticPlanFacts;
   staticValueCandidates: OxcStaticValueCandidate[];

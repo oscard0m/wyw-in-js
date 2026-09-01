@@ -1,5 +1,6 @@
 export type {
   OxcStaticImportReference,
+  OxcPureCallHint,
   OxcStaticValue,
   OxcStaticValueCandidate,
   StaticBindings,

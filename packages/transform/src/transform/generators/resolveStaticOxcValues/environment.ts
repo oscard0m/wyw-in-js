@@ -8,6 +8,8 @@ import { parseOxcProgram } from '../../../utils/oxc/parse';
 import { stripQueryAndHash } from '../../../utils/parseRequest';
 import type { ITransformAction } from '../../types';
 import type { StaticResolveDebugEvent } from './types';
+import type { OxcPureCallHint } from '../../../utils/collectOxcTemplateDependencies';
+import type { ExpressionSpan } from '../../../utils/collectOxcTemplateDependencies/types';
 
 export const isInsideRoot = (filename: string, root: string): boolean => {
   const relativePath = relative(root, filename);
@@ -51,11 +53,16 @@ export type StaticRejectionReason =
   | 'runtime-callback'
   | 'not-eval-dependency';
 
+export type StaticRejectionDetail = {
+  pureCallHintSpan?: ExpressionSpan;
+  reason: StaticRejectionReason;
+};
+
 const reasonExplanations: Record<StaticRejectionReason, string> = {
   'candidate-import-unresolved': "imported value isn't statically analyzable",
   'candidate-callable-usage-unsupported': 'depends on a runtime function call',
   'candidate-mutation-guard-unresolved':
-    'an earlier call may mutate an imported value',
+    'an earlier call may mutate a value used by this interpolation',
   'candidate-expression-non-serializable':
     'value is non-serializable at build time',
   'candidate-expression-undefined':
@@ -71,6 +78,7 @@ export type UnresolvedValueDetail = {
   importedFrom?: string;
   /** Why the value could not be resolved, when the resolver determined it. */
   reason?: StaticRejectionReason;
+  pureCallHints?: OxcPureCallHint[];
 };
 
 const leadFor = (
@@ -139,6 +147,36 @@ export const getStaticStrategyFailure = (
 
   const body = groups.map(renderGroup).join('\n\n');
 
+  const pureCallHints = new Map<string, OxcPureCallHint>();
+  names.forEach((name) => {
+    const detail = details?.get(name);
+    if (
+      detail?.reason &&
+      detail.reason !== 'candidate-mutation-guard-unresolved'
+    ) {
+      return;
+    }
+    detail?.pureCallHints?.forEach((hint) => {
+      pureCallHints.set(
+        `${hint.callFilename}:${hint.callStart}:${hint.callEnd}`,
+        hint
+      );
+    });
+  });
+  const hintText =
+    pureCallHints.size > 0
+      ? `\n\nCalls that may be safe to annotate:\n${[...pureCallHints.values()]
+          .map(
+            (hint) =>
+              `  - ${hint.callFilename}:${hint.callLine}:${
+                hint.callColumn + 1
+              }\n` +
+              `    If this call is side-effect-free, annotate it as: ` +
+              `/*#__PURE__*/ ${hint.callSource}`
+          )
+          .join('\n')}`
+      : '';
+
   // The generic catch-all is only useful when no value carries a specific
   // reason; otherwise the per-group explanations already say why.
   const anyReason = groups.some((group) => group.reason);
@@ -149,7 +187,7 @@ export const getStaticStrategyFailure = (
 
   return new Error(
     `[wyw-in-js] eval.strategy: "static" cannot fall back to the build-time evaluator for ${filename}.\n` +
-      `These interpolated values could not be resolved at build time:\n${body}\n${generic}\n` +
+      `These interpolated values could not be resolved at build time:\n${body}${hintText}\n${generic}\n` +
       `Either make them statically analyzable, or relax eval.strategy from "static" to "hybrid".`
   );
 };

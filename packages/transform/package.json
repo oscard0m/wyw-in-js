@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "@jridgewell/remapping": "^2.3.5",
+    "@jridgewell/trace-mapping": "^0.3.31",
     "@wyw-in-js/processor-utils": "workspace:*",
     "@wyw-in-js/shared": "workspace:*",
     "cosmiconfig": "^8.0.0",

@@ -10,6 +10,7 @@ import type {
   OxcProcessorAnalysisPlan,
   StaticPlanFacts,
 } from '../utils/applyOxcProcessors/types';
+import type { OxcPureCallHint } from '../utils/collectOxcTemplateDependencies';
 
 export type ParsedAst = unknown;
 
@@ -47,6 +48,7 @@ export interface IPreevalResult {
   ) => void;
   metadata: WYWTransformMetadata | null;
   processorClassNames?: Record<string, string>;
+  pureCallHints?: OxcPureCallHint[];
   runtimeProcessorPlan?: OxcProcessorAnalysisPlan;
   staticImportLocals?: string[];
   staticSideEffectImportLocals?: string[];
@@ -71,6 +73,10 @@ export interface IPreevalResult {
         local: string;
         source: string;
       }>;
+      pureCallHintSpan?: {
+        end: number;
+        start: number;
+      };
       source: string;
     }>;
     name: string;

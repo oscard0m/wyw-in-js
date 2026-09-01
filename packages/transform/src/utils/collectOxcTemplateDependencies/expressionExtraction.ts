@@ -2,7 +2,7 @@
 
 import type { ExpressionValue } from '@wyw-in-js/shared';
 import { ValueType } from '@wyw-in-js/shared';
-import type { Expression, Program } from 'oxc-parser';
+import type { Expression, Node, Program } from 'oxc-parser';
 
 import { collectOxcPatternRuntimeExpressions } from '../oxc/patterns';
 import { applyOxcReplacements } from '../oxc/replacements';
@@ -49,7 +49,7 @@ import {
   allocateExpressionName,
   collectBindingMutationGuardsBefore,
   collectStaticBindingExpression,
-  collectStaticMutationGuardExpression,
+  collectStaticMutationGuardExpressions,
   containsProcessorManagedExpression,
   declarationInitCode,
   declarationPatternCode,
@@ -62,11 +62,13 @@ import {
 } from './staticLocalPlanning';
 import { inferSnapshotExpressionKind } from './snapshotValueAnalysis';
 import * as recursiveProof from './recursiveProof';
+import { collectPureAnnotatedInvocationSpans } from './pureAnnotations';
 import type {
   Binding,
   ExtractedExpression,
   ExpressionSpan,
   ExtractionContext,
+  OxcPureCallHint,
   OxcStaticImportReference,
   ProgramAnalysis,
   StaticBindings,
@@ -463,6 +465,94 @@ const extractExpression = (
     ...namespaceStatic.imports,
   ];
   const staticMutationGuards: StaticLocalExpression[] = [];
+  const pureCallHints = new Map<
+    string,
+    Omit<OxcPureCallHint, 'expressionName' | 'expressionSource'>
+  >();
+  const localPureCallHints = new Map<
+    string,
+    {
+      guarded: boolean;
+      hint: Omit<OxcPureCallHint, 'expressionName' | 'expressionSource'>;
+    }
+  >();
+  const pureCallHintSpansByMutationGuard = new WeakMap<
+    Expression,
+    ExpressionSpan
+  >();
+  const collectMutationGuards = (
+    binding: Binding,
+    referenceStart: number,
+    guardedHazards?: Set<Node>
+  ): readonly Expression[] | null =>
+    collectBindingMutationGuardsBefore(
+      binding,
+      referenceStart,
+      ctx,
+      (hazard, guards) => {
+        const key = `${hazard.start}:${hazard.end}`;
+        const location = ctx.loc(hazard.start);
+        const hint =
+          pureCallHints.get(key) ??
+          ({
+            callColumn: location.column,
+            callEnd: hazard.end,
+            callFilename: ctx.filename,
+            callLine: location.line,
+            callSource: ctx.code.slice(hazard.start, hazard.end),
+            callStart: hazard.start,
+          } satisfies Omit<
+            OxcPureCallHint,
+            'expressionName' | 'expressionSource'
+          >);
+        const guarded = !!guards && guards.length > 0;
+        if (guarded) {
+          guardedHazards?.add(hazard);
+        }
+        if (!guarded && binding.importedFrom) {
+          hint.actionableWithoutRejection = true;
+        }
+        pureCallHints.set(key, hint);
+        if (!binding.importedFrom) {
+          const existing = localPureCallHints.get(key);
+          localPureCallHints.set(key, {
+            guarded: existing ? existing.guarded && guarded : guarded,
+            hint,
+          });
+        }
+        guards?.forEach((guard) => {
+          pureCallHintSpansByMutationGuard.set(guard, {
+            end: hazard.end,
+            start: hazard.start,
+          });
+        });
+      }
+    );
+  const resolveMutationGuards = (
+    mutationGuardExpressions: readonly Expression[],
+    guardedHazards: ReadonlySet<Node> = new Set()
+  ): StaticLocalExpression[] | null => {
+    const resolved: StaticLocalExpression[] = [];
+    for (const guardExpression of mutationGuardExpressions) {
+      const guards = collectStaticMutationGuardExpressions(
+        guardExpression,
+        ctx,
+        guardedHazards
+      );
+      if (!guards) {
+        return null;
+      }
+      const pureCallHintSpan =
+        pureCallHintSpansByMutationGuard.get(guardExpression);
+      resolved.push(
+        ...guards.map((guard) =>
+          pureCallHintSpan ? { ...guard, pureCallHintSpan } : guard
+        )
+      );
+    }
+
+    return resolved;
+  };
   let hasNonStaticLocalReference = preserveRuntimeIdentity;
   let hasInlinableLocalReference = false;
   let hasSnapshotReplay = preserveRuntimeIdentity;
@@ -496,26 +586,19 @@ const extractExpression = (
 
     if (binding.importedFrom) {
       importedFrom.push(binding.importedFrom);
-      const mutationGuardExpressions = collectBindingMutationGuardsBefore(
-        binding,
-        start,
-        ctx
-      );
+      const mutationGuardExpressions = collectMutationGuards(binding, start);
       if (mutationGuardExpressions === null) {
         hasNonStaticLocalReference = true;
         return;
       }
-      for (const guardExpression of mutationGuardExpressions) {
-        const guard = collectStaticMutationGuardExpression(
-          guardExpression,
-          ctx
-        );
-        if (!guard) {
-          hasNonStaticLocalReference = true;
-          return;
-        }
-        staticMutationGuards.push(guard);
+      const resolvedMutationGuards = resolveMutationGuards(
+        mutationGuardExpressions
+      );
+      if (!resolvedMutationGuards) {
+        hasNonStaticLocalReference = true;
+        return;
       }
+      staticMutationGuards.push(...resolvedMutationGuards);
 
       if (binding.imported && binding.imported !== '*') {
         staticImports.push({
@@ -549,6 +632,13 @@ const extractExpression = (
       return;
     }
 
+    const guardedHazards = new Set<Node>();
+    const localMutationGuardExpressions = collectMutationGuards(
+      binding,
+      start,
+      guardedHazards
+    );
+
     const init = binding.declarator?.init;
     // Processor-managed bindings (`const x = css```, or object literals
     // containing processor tags) carry values that only become known after
@@ -560,13 +650,26 @@ const extractExpression = (
       (containsTaggedTemplateExpression(init) ||
         containsProcessorManagedExpression(init, ctx));
     const staticLocalExpression =
-      evaluate && init && !isProcessorManagedLocal
-        ? collectStaticBindingExpression(binding, start, ctx)
+      evaluate &&
+      init &&
+      !isProcessorManagedLocal &&
+      localMutationGuardExpressions !== null
+        ? collectStaticBindingExpression(
+            binding,
+            start,
+            ctx,
+            [],
+            guardedHazards
+          )
         : null;
-    if (staticLocalExpression) {
+    const localStaticMutationGuards = localMutationGuardExpressions
+      ? resolveMutationGuards(localMutationGuardExpressions, guardedHazards)
+      : null;
+    if (staticLocalExpression && localStaticMutationGuards) {
       staticIdentifierReplacements.set(start, staticLocalExpression.source);
       importedFrom.push(...staticLocalExpression.importedFrom);
       staticImports.push(...staticLocalExpression.imports);
+      staticMutationGuards.push(...localStaticMutationGuards);
     } else if (isProcessorManagedLocal) {
       hasInlinableLocalReference = true;
     } else {
@@ -628,6 +731,39 @@ const extractExpression = (
     );
   }
 
+  const hasStaticCandidatePlan =
+    !isFunction &&
+    !hasNonStaticLocalReference &&
+    (staticImports.length > 0 ||
+      hasInlinableLocalReference ||
+      staticExpressionCode !== undefined);
+  if (evaluate && !hasStaticCandidatePlan && localPureCallHints.size > 0) {
+    const localHints = [...localPureCallHints.values()];
+    const unconditionalHints = localHints.filter((item) => !item.guarded);
+    const hintsToProbe =
+      unconditionalHints.length > 0 ? unconditionalHints : localHints;
+    const pureAnnotatedInvocationSpans = new Set(
+      ctx.pureAnnotatedInvocationSpans
+    );
+    hintsToProbe.forEach(({ hint }) => {
+      pureAnnotatedInvocationSpans.add(`${hint.callStart}:${hint.callEnd}`);
+    });
+    const probeCtx: ExtractionContext = {
+      ...ctx,
+      pureAnnotatedInvocationSpans,
+      staticCallProof: recursiveProof.create(),
+    };
+    if (
+      !expressionHasNestedCallTimeUncertainty(expression, probeCtx) &&
+      literalCode(evaluateStatic(expression, probeCtx)) !== null
+    ) {
+      for (const item of hintsToProbe) {
+        const { hint } = item;
+        hint.actionableWithoutRejection = true;
+      }
+    }
+  }
+
   return {
     expressionCode:
       identifierReplacements.size > 0
@@ -640,6 +776,7 @@ const extractExpression = (
         : source,
     importedFrom,
     kind: isFunction ? ValueType.FUNCTION : ValueType.LAZY,
+    pureCallHints: [...pureCallHints.values()],
     staticExpressionCode,
     hasInlinableLocalReference:
       !hasNonStaticLocalReference && hasInlinableLocalReference,
@@ -711,6 +848,7 @@ const extractExpressions = (
       code,
       dependencyNames: [],
       expressionValues: [],
+      pureCallHints: [],
       replacements: [],
       staticValueCandidates: [],
       staticValues: [],
@@ -734,6 +872,11 @@ const extractExpressions = (
       processorManagedExpressionSpans.map(expressionSpanKey)
     ),
     program,
+    pureAnnotatedInvocationSpans: collectPureAnnotatedInvocationSpans(
+      code,
+      filename,
+      program
+    ),
     replacements: [],
     rootMutationHazardGuardsByBinding:
       analysis.rootMutationHazardGuardsByBinding,
@@ -748,6 +891,7 @@ const extractExpressions = (
   };
 
   const snapshotWriteFallbackBindings = new Set<Binding>();
+  const pureCallHints: OxcPureCallHint[] = [];
   if (allowSnapshotWriteFallback) {
     expressions.forEach((expression, index) => {
       ctx.currentInsertionPoint = insertionPoints[index] ?? 0;
@@ -776,6 +920,7 @@ const extractExpressions = (
       hasInlinableLocalReference,
       importedFrom,
       kind,
+      pureCallHints: expressionPureCallHints = [],
       staticExpressionCode,
       staticImports,
       staticMutationGuards,
@@ -787,6 +932,13 @@ const extractExpressions = (
       snapshotWriteFallbackBindings
     );
     const expName = allocateExpressionName(ctx);
+    pureCallHints.push(
+      ...expressionPureCallHints.map((hint) => ({
+        ...hint,
+        expressionName: expName,
+        expressionSource: ctx.code.slice(expression.start, expression.end),
+      }))
+    );
 
     addHoistedCode(
       expName,
@@ -815,7 +967,11 @@ const extractExpressions = (
       });
       const uniqueMutationGuards = new Map<string, StaticLocalExpression>();
       staticMutationGuards.forEach((guard) => {
-        uniqueMutationGuards.set(guard.source, guard);
+        const hintSpan = guard.pureCallHintSpan;
+        const key = hintSpan
+          ? `${guard.source}\0${hintSpan.start}:${hintSpan.end}`
+          : guard.source;
+        uniqueMutationGuards.set(key, guard);
       });
       ctx.staticValueCandidates.push({
         imports: [...uniqueImports.values()],
@@ -855,6 +1011,7 @@ const extractExpressions = (
     code: applyOxcReplacements(code, ctx.replacements),
     dependencyNames: [...ctx.dependencyNames],
     expressionValues: ctx.expressionValues,
+    pureCallHints,
     replacements: ctx.replacements,
     staticValueCandidates: ctx.staticValueCandidates,
     staticValues: ctx.staticValues,
@@ -900,6 +1057,11 @@ export const evaluateOxcStaticExpressionAt = (
       processorManagedExpressionSpans.map(expressionSpanKey)
     ),
     program,
+    pureAnnotatedInvocationSpans: collectPureAnnotatedInvocationSpans(
+      code,
+      filename,
+      program
+    ),
     replacements: [],
     rootMutationHazardGuardsByBinding:
       analysis.rootMutationHazardGuardsByBinding,

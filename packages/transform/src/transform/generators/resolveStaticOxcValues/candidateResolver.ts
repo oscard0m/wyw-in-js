@@ -14,6 +14,7 @@ import { resolveDependency } from './dependencies';
 import {
   debugStaticResolve,
   getStaticBindings,
+  type StaticRejectionDetail,
   type StaticRejectionReason,
 } from './environment';
 import { resolveImportValue } from './exportResolver';
@@ -118,10 +119,13 @@ export function* resolveCandidateValue(
   candidate: OxcStaticValueCandidate,
   filename: string,
   memo: Map<string, StaticExportResult | null>,
-  reasons?: Map<string, StaticRejectionReason>
+  rejections?: Map<string, StaticRejectionDetail>
 ): SyncScenarioFor<StaticExportResult | null> {
-  const reject = (reason: StaticRejectionReason): null => {
-    reasons?.set(candidate.name, reason);
+  const reject = (
+    reason: StaticRejectionReason,
+    pureCallHintSpan?: StaticRejectionDetail['pureCallHintSpan']
+  ): null => {
+    rejections?.set(candidate.name, { pureCallHintSpan, reason });
     return null;
   };
   const env = new Map<string, unknown>();
@@ -247,7 +251,10 @@ export function* resolveCandidateValue(
         reason: 'candidate-mutation-guard-unresolved',
         status: 'rejected',
       });
-      return reject('candidate-mutation-guard-unresolved');
+      return reject(
+        'candidate-mutation-guard-unresolved',
+        guard.pureCallHintSpan
+      );
     }
   }
 

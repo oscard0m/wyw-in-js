@@ -4,6 +4,7 @@ import { isAbsolute } from 'path';
 
 import { appendOxcWywPreval } from '../../../utils/oxcPreevalStage';
 import { stripQueryAndHash } from '../../../utils/parseRequest';
+import { remapPureCallHints } from '../../../utils/pureCallHintSourceMap';
 import type { ITransformAction, SyncScenarioFor } from '../../types';
 import {
   resolveCandidateValue,
@@ -16,7 +17,7 @@ import {
   parseProgram,
 } from './environment';
 import type {
-  StaticRejectionReason,
+  StaticRejectionDetail,
   UnresolvedValueDetail,
 } from './environment';
 import {
@@ -67,8 +68,13 @@ export function* resolveStaticOxcPreevalValues(
   const evalDependencyNames = new Set(preevalResult.dependencyNames ?? []);
   const staticOnly = evalStrategy === 'static';
 
-  // candidate name -> why it was rejected, populated by the resolvers below.
-  const rejectionReasons = new Map<string, StaticRejectionReason>();
+  // candidate name -> why it was rejected and the precise guard responsible.
+  const rejections = new Map<string, StaticRejectionDetail>();
+  const inputSourceMap =
+    stripQueryAndHash(filename) ===
+    stripQueryAndHash(this.services.options.filename)
+      ? this.services.options.inputSourceMap
+      : undefined;
 
   const buildUnresolvedDetails = (
     names: Iterable<string>
@@ -80,11 +86,47 @@ export function* resolveStaticOxcPreevalValues(
         continue;
       }
 
+      const rejection = rejections.get(candidate.name);
       details.set(candidate.name, {
         source: candidate.source,
         importedFrom: candidate.imports[0]?.source,
-        reason: rejectionReasons.get(candidate.name),
+        reason: rejection?.reason,
       });
+    }
+
+    for (const rawHint of preevalResult.pureCallHints ?? []) {
+      if (!wanted.has(rawHint.expressionName)) {
+        continue;
+      }
+      const detail = details.get(rawHint.expressionName) ?? {
+        source: rawHint.expressionSource,
+        reason: 'candidate-mutation-guard-unresolved' as const,
+      };
+      const rejection = rejections.get(rawHint.expressionName);
+      const rejectedSpan = rejection?.pureCallHintSpan;
+      if (
+        rejection &&
+        rejection.reason !== 'candidate-mutation-guard-unresolved'
+      ) {
+        continue;
+      }
+      if (rejection) {
+        if (
+          !rejectedSpan ||
+          rejectedSpan.start !== rawHint.callStart ||
+          rejectedSpan.end !== rawHint.callEnd
+        ) {
+          continue;
+        }
+      } else if (!rawHint.actionableWithoutRejection) {
+        continue;
+      }
+      const [displayHint] = remapPureCallHints([rawHint], inputSourceMap);
+      if (!displayHint) {
+        continue;
+      }
+      detail.pureCallHints = [...(detail.pureCallHints ?? []), displayHint];
+      details.set(rawHint.expressionName, detail);
     }
 
     return details;
@@ -178,7 +220,7 @@ export function* resolveStaticOxcPreevalValues(
         !isOpaqueRuntimeBaseHelper &&
         !staticValueCache.has(candidate.name)
       ) {
-        rejectionReasons.set(candidate.name, 'not-eval-dependency');
+        rejections.set(candidate.name, { reason: 'not-eval-dependency' });
         debugStaticResolve(action, {
           candidate: candidate.name,
           filename,
@@ -225,7 +267,7 @@ export function* resolveStaticOxcPreevalValues(
             candidate,
             filename,
             memo,
-            rejectionReasons
+            rejections
           );
         }
       } else {
@@ -234,7 +276,7 @@ export function* resolveStaticOxcPreevalValues(
           candidate,
           filename,
           memo,
-          rejectionReasons
+          rejections
         );
       }
       if (!resolved) {

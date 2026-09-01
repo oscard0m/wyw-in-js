@@ -109,10 +109,24 @@ export type OxcStaticValueCandidate = {
   source: string;
 };
 
+export type OxcPureCallHint = {
+  /** The hint is useful even when no candidate guard reached the resolver. */
+  actionableWithoutRejection?: boolean;
+  callEnd: number;
+  callColumn: number;
+  callFilename: string;
+  callLine: number;
+  callSource: string;
+  callStart: number;
+  expressionName: string;
+  expressionSource: string;
+};
+
 export type TemplateExtractionResult = {
   code: string;
   dependencyNames: string[];
   expressionValues: Omit<ExpressionValue, 'buildCodeFrameError'>[];
+  pureCallHints: OxcPureCallHint[];
   replacements: OxcValueReplacement[];
   staticValueCandidates: OxcStaticValueCandidate[];
   staticValues: OxcStaticValue[];
@@ -125,6 +139,9 @@ export type ExtractedExpression = {
   hasInlinableLocalReference?: boolean;
   importedFrom: string[];
   kind: ValueType.FUNCTION | ValueType.LAZY;
+  pureCallHints?: Array<
+    Omit<OxcPureCallHint, 'expressionName' | 'expressionSource'>
+  >;
   staticExpressionCode?: string;
   staticImports: OxcStaticImportReference[];
   staticMutationGuards: StaticLocalExpression[];
@@ -134,6 +151,7 @@ export type ExtractedExpression = {
 export type StaticLocalExpression = {
   importedFrom: string[];
   imports: OxcStaticImportReference[];
+  pureCallHintSpan?: ExpressionSpan;
   source: string;
 };
 
@@ -168,6 +186,7 @@ export type ExtractionContext = {
   loc: LocationLookup;
   processorManagedExpressionSpans: Set<string>;
   program: Program;
+  pureAnnotatedInvocationSpans: Set<string>;
   replacements: Replacement[];
   rootMutationHazardGuardsByBinding: MutationHazardGuardMap;
   rootMutationHazardsByBinding: MutationTimelineLookup;

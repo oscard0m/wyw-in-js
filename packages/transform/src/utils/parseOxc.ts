@@ -1,5 +1,5 @@
 import { parseSync } from 'oxc-parser';
-import type { Program } from 'oxc-parser';
+import type { Comment, Program } from 'oxc-parser';
 
 import {
   recordPipelineCachedParseMiss,
@@ -9,6 +9,7 @@ import {
 type OxcSourceType = 'module' | 'unambiguous';
 
 type ParsedOxc = {
+  comments: Comment[];
   jsxFallback: boolean;
   module: {
     hasModuleSyntax: boolean;
@@ -24,6 +25,7 @@ type ParsedOxc = {
 // keeps every entry hot across the actions for a single file.
 const MAX_PARSE_CACHE_ENTRIES = 1000;
 const parseCache = new Map<string, ParsedOxc>();
+const commentsByProgram = new WeakMap<Program, readonly Comment[]>();
 
 const getAstType = (filename: string): 'js' | 'ts' =>
   filename.endsWith('.ts') || filename.endsWith('.tsx') ? 'ts' : 'js';
@@ -42,6 +44,7 @@ const makeCacheKey = (
 
 const setCachedParse = (key: string, value: ParsedOxc): ParsedOxc => {
   parseCache.set(key, value);
+  commentsByProgram.set(value.program, value.comments);
   if (parseCache.size > MAX_PARSE_CACHE_ENTRIES) {
     const oldestKey = parseCache.keys().next().value;
     if (oldestKey) {
@@ -133,6 +136,7 @@ export const parseOxcCached = (
   }
 
   const cachedParse = setCachedParse(cacheKey, {
+    comments: parsed.comments,
     jsxFallback,
     module: {
       hasModuleSyntax: parsed.module.hasModuleSyntax,
@@ -160,3 +164,7 @@ export const parseOxcProgramCached = (
   code: string,
   sourceType: OxcSourceType
 ): Program => parseOxcCached(filename, code, sourceType).program;
+
+export const getOxcProgramComments = (
+  program: Program
+): readonly Comment[] | undefined => commentsByProgram.get(program);

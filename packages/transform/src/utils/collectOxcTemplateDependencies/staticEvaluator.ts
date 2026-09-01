@@ -81,6 +81,13 @@ export const isKnownPureStaticCall = (
     return true;
   }
 
+  if (
+    (node.type === 'CallExpression' || node.type === 'NewExpression') &&
+    ctx.pureAnnotatedInvocationSpans.has(`${node.start}:${node.end}`)
+  ) {
+    return true;
+  }
+
   if (node.type !== 'CallExpression' || node.callee.type !== 'Identifier') {
     return false;
   }
