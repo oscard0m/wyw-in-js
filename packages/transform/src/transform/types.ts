@@ -39,6 +39,14 @@ export type Services = {
     stack: string[]
   ) => Promise<string | null>;
   asyncResolveKey?: string;
+  /**
+   * Optional lifetime scope for the eval runner process. This is deliberately
+   * separate from `cache`: callers may safely reuse the process while keeping
+   * transform caches and resolver semantics isolated.
+   */
+  evalBrokerScope?: object;
+  /** Hash of the resolver/eval semantics configured for this transform. */
+  evalCacheKey?: string;
   evalBroker?: EvalBroker;
 };
 

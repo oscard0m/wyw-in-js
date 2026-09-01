@@ -36,13 +36,55 @@ export type LoaderOptions = {
   keepComments?: boolean;
   outputCss?: boolean;
   prefixer?: boolean;
+  /**
+   * Reuse transform and eval state across loader invocations which are known
+   * to have identical transform and eval semantics. Every output-affecting
+   * option, alias, condition, and compilation graph must match. Keys are kept
+   * for the loader module's lifetime, so use a finite, stable set of values.
+   */
+  resolverScopeKey?: string;
   sourceMap?: boolean;
 } & Partial<PluginOptions>;
 
 type Loader = RawLoaderDefinitionFunction<LoaderOptions>;
 type ResolveFn = ReturnType<LoaderContext<LoaderOptions>['getResolve']>;
 
-const cache = new TransformCacheCollection();
+type TransformScope = {
+  asyncResolveKey: string;
+  cache: TransformCacheCollection;
+};
+
+let resolverScopeId = 0;
+const sharedResolverScopes = new Map<string, TransformScope>();
+
+// Turbopack exposes a fresh resolver closure for every loader call, but no
+// compiler/compilation identity. Keep the expensive child process alive at
+// this module's lifetime while the transform package isolates each semantic
+// resolver session inside that process.
+const evalBrokerScope = {};
+
+const createTransformScope = (): TransformScope => {
+  resolverScopeId += 1;
+  return {
+    asyncResolveKey: `turbopack:${resolverScopeId}`,
+    cache: new TransformCacheCollection(),
+  };
+};
+
+const getTransformScope = (scopeKey: string | undefined) => {
+  if (scopeKey === undefined) {
+    return createTransformScope();
+  }
+
+  const cached = sharedResolverScopes.get(scopeKey);
+  if (cached) {
+    return cached;
+  }
+
+  const scope = createTransformScope();
+  sharedResolverScopes.set(scopeKey, scope);
+  return scope;
+};
 
 function convertSourceMap(
   value: RawSourceMap | string | null | undefined,
@@ -113,9 +155,18 @@ const turbopackLoader: Loader = function turbopackLoader(
     outputCss,
     cssOutputMode = 'sidecar',
     prefixer,
+    resolverScopeKey,
     configFile,
     ...rest
   } = this.getOptions() || {};
+
+  if (
+    resolverScopeKey !== undefined &&
+    (typeof resolverScopeKey !== 'string' || resolverScopeKey.length === 0)
+  ) {
+    callback(new Error('resolverScopeKey must be a non-empty string'));
+    return;
+  }
 
   if (configFile) {
     const configPath = path.isAbsolute(configFile)
@@ -134,9 +185,10 @@ const turbopackLoader: Loader = function turbopackLoader(
   const resolveModule = this.getResolve({ dependencyType: 'esm' });
 
   const asyncResolve = async (token: string, importer: string) => {
-    const context = path.isAbsolute(importer)
-      ? path.dirname(importer)
-      : path.join(process.cwd(), path.dirname(importer));
+    const importerPath = stripQueryAndHash(importer);
+    const context = path.isAbsolute(importerPath)
+      ? path.dirname(importerPath)
+      : path.join(process.cwd(), path.dirname(importerPath));
 
     const result = await resolveWith(resolveModule, context, token);
 
@@ -151,6 +203,8 @@ const turbopackLoader: Loader = function turbopackLoader(
 
     return result;
   };
+
+  const transformScope = getTransformScope(resolverScopeKey);
 
   const addResolvedDependency = async (
     dependency: string,
@@ -177,7 +231,9 @@ const turbopackLoader: Loader = function turbopackLoader(
       keepComments,
       root: process.cwd(),
     },
-    cache,
+    asyncResolveKey: transformScope.asyncResolveKey,
+    cache: transformScope.cache,
+    evalBrokerScope,
     emitWarning: (message: string) => {
       if (typeof this.emitWarning === 'function') {
         const warning = new Error(message);

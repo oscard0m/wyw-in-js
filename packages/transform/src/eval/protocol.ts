@@ -20,6 +20,8 @@ export type EvalRunnerInitPayload = {
   debugEvalFiles?: boolean;
   entrypoint: string;
   reuseModules?: boolean;
+  /** Logical broker session used to discard replies from prior INITs. */
+  sessionId?: number;
 };
 
 export type EvalRequest = {
@@ -91,7 +93,7 @@ export type InitAckMessage = {
   id: string;
   error?: SerializedError;
   // Set by the runner when it just reset its moduleCache during INIT (full
-  // reset on context rebuild, or `reuseModules: false`). The broker uses
+  // context rebuild, including every `reuseModules: false`). The broker uses
   // this to invalidate its "what runner has" mirror without doing any
   // payload hashing or stringification on its own hot path.
   modulesReset?: boolean;
@@ -114,6 +116,7 @@ export type ResolveMessage = {
   type: 'RESOLVE';
   id: string;
   payload: ResolveRequestPayload;
+  sessionId?: number;
 };
 
 export type ResolveResultMessage = {
@@ -126,6 +129,7 @@ export type LoadMessage = {
   type: 'LOAD';
   id: string;
   payload: LoadRequestPayload;
+  sessionId?: number;
 };
 
 export type LoadResultMessage = {

@@ -1118,11 +1118,14 @@ const moduleLastVariant = new Map();
 const linkPromises = new Map();
 const loadInFlight = new Map();
 const externalInFlight = new Map();
+const dynamicEvaluations = new Set();
 const resolveCache = new LruCache(RESOLVE_CACHE_SIZE);
 const resolveInFlight = new Map();
 
 const pending = new Map();
 const loadResultChunks = new Map();
+let activeSessionId = 0;
+let activeSessionRef = { id: 0 };
 // Ids evicted during the in-flight EVAL session via resetSingleModuleState.
 // Surfaced in EVAL_RESULT so the broker can drop matching entries from its
 // "what runner has" mirror (lastSentLoadByModule) — otherwise the broker would
@@ -1152,6 +1155,7 @@ const resetModuleState = () => {
   linkPromises.clear();
   loadInFlight.clear();
   externalInFlight.clear();
+  dynamicEvaluations.clear();
   resolveInFlight.clear();
   resolveCache.clear();
   sentNamespaceIdentifiers.clear();
@@ -1229,6 +1233,14 @@ const resetEvaluationState = () => {
   state.globalsSignature = null;
   resetModuleState();
 };
+
+// Stale async work belongs to a VM context which has already been discarded.
+// Leave that work pending instead of rejecting it: user code commonly starts
+// fire-and-forget dynamic imports, and rejecting those during INIT would turn
+// a normal session transition into an unhandled rejection.
+const abandonStaleSession = () => new Promise(() => {});
+
+const isSessionActive = (sessionId) => sessionId === activeSessionId;
 
 const normalizeWriteError = (label, error) => {
   if (error instanceof Error) {
@@ -1399,13 +1411,16 @@ const serializeError = (error) => {
   return result;
 };
 
-const request = (type, payload) => {
+const request = (type, payload, sessionId = activeSessionId) => {
   nextId += 1;
   const id = `${nextId}`;
-  sendMessage({ type, id, payload });
-  return new Promise((resolve, reject) => {
+  sendMessage({ type, id, payload, sessionId });
+  const response = new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
   });
+  return response.then((value) =>
+    isSessionActive(sessionId) ? value : abandonStaleSession()
+  );
 };
 
 const resolvePending = (id, payload) => {
@@ -1416,6 +1431,10 @@ const resolvePending = (id, payload) => {
 };
 
 const handleLoadResult = (id, payload) => {
+  // A full INIT drops all requests from the previous semantic session. Late
+  // chunks for one of those ids must not recreate a partial-response entry.
+  if (!pending.has(id)) return;
+
   if (
     !payload ||
     typeof payload.codeChunk !== 'string' ||
@@ -1764,13 +1783,23 @@ const resolveExternalImportTarget = (resolvedFile, importer, specifier) => {
   return { target: importerResolved, resolvedFile: null };
 };
 
-const loadExternalModule = async (resolvedId, importer, specifier, kind) => {
+const loadExternalModule = async (
+  resolvedId,
+  importer,
+  specifier,
+  kind,
+  sessionId = activeSessionId
+) => {
+  if (!isSessionActive(sessionId)) return abandonStaleSession();
   const cacheId = resolvedId ?? specifier;
   const cached = moduleCache.get(cacheId);
   if (cached) return cached;
 
   const inFlight = externalInFlight.get(cacheId);
-  if (inFlight) return inFlight;
+  if (inFlight) {
+    const result = await inFlight;
+    return isSessionActive(sessionId) ? result : abandonStaleSession();
+  }
 
   const task = (async () => {
     const start = Date.now();
@@ -1861,6 +1890,7 @@ const loadExternalModule = async (resolvedId, importer, specifier, kind) => {
     try {
       value = await loadWithNode();
     } catch (error) {
+      if (!isSessionActive(sessionId)) return abandonStaleSession();
       if (
         resolvedFile &&
         isNodeModulesId(resolvedFile) &&
@@ -1872,10 +1902,12 @@ const loadExternalModule = async (resolvedId, importer, specifier, kind) => {
           importer,
           errorCode: error?.code,
         });
-        return loadModule(resolvedFile, importer, specifier);
+        return loadModule(resolvedFile, importer, specifier, sessionId);
       }
       throw error;
     }
+
+    if (!isSessionActive(sessionId)) return abandonStaleSession();
 
     const module = createSyntheticModule(cacheId, toSyntheticExports(value));
     debug('external:done', {
@@ -1888,9 +1920,12 @@ const loadExternalModule = async (resolvedId, importer, specifier, kind) => {
 
   externalInFlight.set(cacheId, task);
   try {
-    return await task;
+    const result = await task;
+    return isSessionActive(sessionId) ? result : abandonStaleSession();
   } finally {
-    externalInFlight.delete(cacheId);
+    if (externalInFlight.get(cacheId) === task) {
+      externalInFlight.delete(cacheId);
+    }
   }
 };
 
@@ -1922,17 +1957,28 @@ const shouldLoadAsExternalModule = (
   return isNodeModulesId(resolvedId);
 };
 
-const linkModule = async (module) => {
+const linkModule = async (module, sessionId = activeSessionId) => {
+  if (!isSessionActive(sessionId)) return abandonStaleSession();
   const cached = linkPromises.get(module);
-  if (cached) return cached;
+  if (cached) {
+    const result = await cached;
+    return isSessionActive(sessionId) ? result : abandonStaleSession();
+  }
   if (module.status !== 'unlinked') return module;
   const linking = (async () => {
     try {
       await module.link((specifier, referencingModule) =>
-        resolveModule(specifier, referencingModule.identifier, 'import')
+        resolveModule(
+          specifier,
+          referencingModule.identifier,
+          'import',
+          sessionId
+        )
       );
+      if (!isSessionActive(sessionId)) return abandonStaleSession();
       return module;
     } catch (error) {
+      if (!isSessionActive(sessionId)) return abandonStaleSession();
       // The vm SourceTextModule is now in 'errored' (or partially-linked)
       // state and can never be re-linked. With reuseModules:true the cached
       // module would otherwise stick around and short-circuit linkModule's
@@ -1971,7 +2017,13 @@ const linkModule = async (module) => {
   return linking;
 };
 
-resolveModule = async (specifier, importer, kind) => {
+resolveModule = async (
+  specifier,
+  importer,
+  kind,
+  sessionId = activeSessionId
+) => {
+  if (!isSessionActive(sessionId)) return abandonStaleSession();
   const importerId = toSourceModuleId(importer);
   if (process.env.WYW_DEBUG_EVAL_RESOLVE) {
     process.stderr.write(
@@ -2027,23 +2079,32 @@ resolveModule = async (specifier, importer, kind) => {
         normalized,
         importerId,
         specifier,
-        kind
+        kind,
+        sessionId
       );
+      if (!isSessionActive(sessionId)) return abandonStaleSession();
       return externalModule;
     }
 
-    return loadModule(normalized, importerId, specifier);
+    return loadModule(normalized, importerId, specifier, sessionId);
   }
 
   const inFlight = resolveInFlight.get(key);
-  if (inFlight) return inFlight;
+  if (inFlight) {
+    const result = await inFlight;
+    return isSessionActive(sessionId) ? result : abandonStaleSession();
+  }
 
   const task = (async () => {
-    const resolved = await request('RESOLVE', {
-      specifier,
-      importerId,
-      kind,
-    });
+    const resolved = await request(
+      'RESOLVE',
+      {
+        specifier,
+        importerId,
+        kind,
+      },
+      sessionId
+    );
 
     if (resolved.error) {
       throw new Error(resolved.error.message);
@@ -2095,28 +2156,49 @@ resolveModule = async (specifier, importer, kind) => {
     );
 
     if (treatExternal) {
-      return loadExternalModule(normalized, importerId, specifier, kind);
+      return loadExternalModule(
+        normalized,
+        importerId,
+        specifier,
+        kind,
+        sessionId
+      );
     }
 
-    return loadModule(normalized, importerId, specifier);
+    return loadModule(normalized, importerId, specifier, sessionId);
   })();
 
   resolveInFlight.set(key, task);
   try {
-    return await task;
+    const result = await task;
+    return isSessionActive(sessionId) ? result : abandonStaleSession();
   } finally {
-    resolveInFlight.delete(key);
+    if (resolveInFlight.get(key) === task) {
+      resolveInFlight.delete(key);
+    }
   }
 };
 
-const loadModuleUnqueued = async (id, importer, requestSpec) => {
+const loadModuleUnqueued = async (
+  id,
+  importer,
+  requestSpec,
+  sessionId,
+  sessionRef
+) => {
+  if (!isSessionActive(sessionId)) return abandonStaleSession();
   let cached = moduleCache.get(id);
   const loadStart = Date.now();
-  const loaded = await request('LOAD', {
-    id,
-    importerId: importer,
-    request: requestSpec ?? null,
-  });
+  const loaded = await request(
+    'LOAD',
+    {
+      id,
+      importerId: importer,
+      request: requestSpec ?? null,
+    },
+    sessionId
+  );
+  if (!isSessionActive(sessionId)) return abandonStaleSession();
   debug('load:done', {
     id,
     importer,
@@ -2268,10 +2350,12 @@ const loadModuleUnqueued = async (id, importer, requestSpec) => {
             : fileId;
         },
         importModuleDynamically(specifier, referencingModule) {
+          const dynamicSessionId = sessionRef.id;
           return resolveModule(
             specifier,
             referencingModule.identifier,
-            'dynamic-import'
+            'dynamic-import',
+            dynamicSessionId
           );
         },
       }
@@ -2295,17 +2379,27 @@ const loadModuleUnqueued = async (id, importer, requestSpec) => {
   }
 };
 
-loadModule = async (id, importer, requestSpec) => {
+loadModule = async (id, importer, requestSpec, sessionId = activeSessionId) => {
+  if (!isSessionActive(sessionId)) return abandonStaleSession();
+  const sessionRef = activeSessionRef;
   const predecessor = loadInFlight.get(id);
   const task = predecessor
     ? (async () => {
         await predecessor;
-        return loadModuleUnqueued(id, importer, requestSpec);
+        if (!isSessionActive(sessionId)) return abandonStaleSession();
+        return loadModuleUnqueued(
+          id,
+          importer,
+          requestSpec,
+          sessionId,
+          sessionRef
+        );
       })()
-    : loadModuleUnqueued(id, importer, requestSpec);
+    : loadModuleUnqueued(id, importer, requestSpec, sessionId, sessionRef);
   loadInFlight.set(id, task);
   try {
-    return await task;
+    const result = await task;
+    return isSessionActive(sessionId) ? result : abandonStaleSession();
   } finally {
     if (loadInFlight.get(id) === task) {
       loadInFlight.delete(id);
@@ -2313,8 +2407,9 @@ loadModule = async (id, importer, requestSpec) => {
   }
 };
 
-const createDynamicImportFn = (importer) => {
+const createDynamicImportFn = (importer, sessionRef) => {
   return async (specifier) => {
+    const sessionId = sessionRef.id;
     if (typeof specifier !== 'string') {
       sendWarn({
         code: 'eval-error',
@@ -2341,14 +2436,34 @@ const createDynamicImportFn = (importer) => {
       specifier,
     });
 
-    const resolved = await resolveModule(specifier, importer, 'dynamic-import');
-    await linkModule(resolved);
-    await resolved.evaluate();
+    const resolved = await resolveModule(
+      specifier,
+      importer,
+      'dynamic-import',
+      sessionId
+    );
+    if (!isSessionActive(sessionId)) return abandonStaleSession();
+    await linkModule(resolved, sessionId);
+    if (!isSessionActive(sessionId)) return abandonStaleSession();
+    const evaluation = resolved.evaluate();
+    dynamicEvaluations.add(evaluation);
+    try {
+      await evaluation;
+    } catch (error) {
+      // A fire-and-forget import from an old VM may reject after INIT has
+      // installed a replacement context. Keep that stale promise abandoned
+      // instead of turning its rejection into an unhandled process failure.
+      if (!isSessionActive(sessionId)) return abandonStaleSession();
+      throw error;
+    } finally {
+      dynamicEvaluations.delete(evaluation);
+    }
+    if (!isSessionActive(sessionId)) return abandonStaleSession();
     return resolved;
   };
 };
 
-const getModuleData = (id) => {
+const getModuleData = (id, sessionRef = activeSessionRef) => {
   const cached = moduleData.get(id);
   if (cached) return cached;
 
@@ -2361,7 +2476,7 @@ const getModuleData = (id) => {
     require: createRequireFn(id),
     filename,
     dirname: path.dirname(filename),
-    dynamicImport: createDynamicImportFn(id),
+    dynamicImport: createDynamicImportFn(id, sessionRef),
   };
 
   moduleData.set(id, data);
@@ -2505,11 +2620,12 @@ const collectModuleExports = () => {
 };
 
 async function evaluateEntrypoint(id) {
+  const sessionId = activeSessionId;
   const evalStart = Date.now();
   debug('eval:start', id);
-  const module = await loadModule(id, id, id);
+  const module = await loadModule(id, id, id, sessionId);
   debug('eval:loaded', { id, durationMs: Date.now() - evalStart });
-  await linkModule(module);
+  await linkModule(module, sessionId);
   debug('eval:linked', { id, durationMs: Date.now() - evalStart });
   await module.evaluate();
   debug('eval:evaluated', { id, durationMs: Date.now() - evalStart });
@@ -2575,9 +2691,31 @@ async function evaluateEntrypoint(id) {
 const handleMessage = async (message) => {
   switch (message.type) {
     case 'INIT': {
+      const initSessionId = Number.isSafeInteger(message.payload.sessionId)
+        ? message.payload.sessionId
+        : activeSessionId + 1;
       try {
         const initStart = Date.now();
         debug('init:start', message.payload.entrypoint ?? 'eval-runner');
+        const sessionChanged = initSessionId !== activeSessionId;
+        const hasUnfinishedSessionWork =
+          sessionChanged &&
+          (pending.size > 0 ||
+            loadResultChunks.size > 0 ||
+            loadInFlight.size > 0 ||
+            externalInFlight.size > 0 ||
+            dynamicEvaluations.size > 0 ||
+            resolveInFlight.size > 0 ||
+            linkPromises.size > 0);
+        activeSessionId = initSessionId;
+        if (sessionChanged) {
+          // Requests from the previous logical session must never resume
+          // inside the context initialized below. Dropping them keeps
+          // abandoned fire-and-forget imports pending without producing
+          // unhandled errors.
+          pending.clear();
+          loadResultChunks.clear();
+        }
         const encodedGlobals = message.payload.evalOptions.globals ?? {};
         const nextGlobalsSignature = JSON.stringify(
           canonicalizeForSignature(encodedGlobals)
@@ -2593,12 +2731,12 @@ const handleMessage = async (message) => {
         const globalsChanged =
           state.globalsSignature !== null &&
           state.globalsSignature !== nextGlobalsSignature;
+        const reuseModules = Boolean(message.payload.reuseModules);
         const nextGlobals =
-          !globalsChanged && state.globalsSignature !== null
+          reuseModules && !globalsChanged && state.globalsSignature !== null
             ? state.evalOptions.globals
             : decodeGlobals(encodedGlobals);
         const nextEvalOptions = {
-          ...state.evalOptions,
           ...message.payload.evalOptions,
           globals: nextGlobals,
         };
@@ -2606,26 +2744,22 @@ const handleMessage = async (message) => {
         const canReuseContext =
           state.context &&
           state.happyDomEnabled === nextHappyDomEnabled &&
-          !globalsChanged;
-        const reuseModules = Boolean(message.payload.reuseModules);
+          !globalsChanged &&
+          !hasUnfinishedSessionWork;
 
-        if (canReuseContext) {
-          const modulesReset = !reuseModules;
-          if (modulesReset) {
-            resetModuleState();
-          } else {
-            // Clear resolution caches between sessions even when reusing modules.
-            // The broker rebuilds onlyByModule from scratch each session (cleared
-            // in evaluate()). If the runner's resolveCache persists, RESOLVE
-            // requests for previously-seen (importer, specifier) pairs are
-            // skipped, preventing the broker from learning what exports are
-            // needed. This can cause a barrel module to be served with a stale
-            // `only` set that's missing exports a consumer actually imports,
-            // leading to "does not provide an export named 'X'" link errors.
-            resolveCache.clear();
-            resolveInFlight.clear();
-            loadInFlight.clear();
-          }
+        if (canReuseContext && reuseModules) {
+          activeSessionRef.id = initSessionId;
+          // Clear resolution caches between sessions even when reusing modules.
+          // The broker rebuilds onlyByModule from scratch each session (cleared
+          // in evaluate()). If the runner's resolveCache persists, RESOLVE
+          // requests for previously-seen (importer, specifier) pairs are
+          // skipped, preventing the broker from learning what exports are
+          // needed. This can cause a barrel module to be served with a stale
+          // `only` set that's missing exports a consumer actually imports,
+          // leading to "does not provide an export named 'X'" link errors.
+          resolveCache.clear();
+          resolveInFlight.clear();
+          loadInFlight.clear();
           state.evalOptions = nextEvalOptions;
           state.features = nextFeatures;
           state.debugEvalFiles = nextDebugEvalFiles;
@@ -2634,11 +2768,16 @@ const handleMessage = async (message) => {
             __dirname: path.dirname(nextEntrypoint),
             __filename: nextEntrypoint,
             ...nextEvalOptions.globals,
-            __wyw_getModule: (moduleId) => getModuleData(moduleId),
+            __wyw_getModule: (moduleId) =>
+              getModuleData(moduleId, activeSessionRef),
           });
           state.globalsSignature = nextGlobalsSignature;
           debug('init:reuse', Date.now() - initStart);
-          sendMessage({ type: 'INIT_ACK', id: message.id, modulesReset });
+          sendMessage({
+            type: 'INIT_ACK',
+            id: message.id,
+            modulesReset: false,
+          });
           break;
         }
 
@@ -2648,6 +2787,7 @@ const handleMessage = async (message) => {
         state.debugEvalFiles = nextDebugEvalFiles;
         state.entrypoint = nextEntrypoint;
         debug('init:globals', Date.now() - initStart);
+        const nextSessionRef = { id: initSessionId };
 
         const windowStart = Date.now();
         const { context, teardown } = await createVmContext(
@@ -2655,10 +2795,16 @@ const handleMessage = async (message) => {
           state.features,
           {
             ...state.evalOptions.globals,
-            __wyw_getModule: (moduleId) => getModuleData(moduleId),
+            __wyw_getModule: (moduleId) =>
+              getModuleData(moduleId, nextSessionRef),
           }
         );
+        if (!isSessionActive(initSessionId)) {
+          teardown();
+          break;
+        }
         debug('init:context', Date.now() - windowStart);
+        activeSessionRef = nextSessionRef;
         state.context = context;
         state.teardown = teardown;
         state.happyDomEnabled = nextHappyDomEnabled;
@@ -2668,6 +2814,7 @@ const handleMessage = async (message) => {
         sendMessage({ type: 'INIT_ACK', id: message.id, modulesReset: true });
         debug('init:done', Date.now() - initStart);
       } catch (error) {
+        if (!isSessionActive(initSessionId)) break;
         sendMessage({
           type: 'INIT_ACK',
           id: message.id,
