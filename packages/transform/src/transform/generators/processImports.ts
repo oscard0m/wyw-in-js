@@ -144,11 +144,17 @@ export function* processImports(
 
     const nextEntrypoint =
       dependency.loadedCode === undefined
-        ? this.entrypoint.createChild(resolved, requiredOnly)
+        ? this.entrypoint.createChild(
+            resolved,
+            requiredOnly,
+            undefined,
+            this.services
+          )
         : this.entrypoint.createChild(
             resolved,
             requiredOnly,
-            dependency.loadedCode
+            dependency.loadedCode,
+            this.services
           );
     if (nextEntrypoint === 'loop' || nextEntrypoint.ignored) {
       continue;

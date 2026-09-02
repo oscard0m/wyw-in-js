@@ -19,7 +19,11 @@ import {
 } from '../transform/generators/resolveImports';
 import { loadWywOptions } from '../transform/helpers/loadWywOptions';
 import { withDefaultServices } from '../transform/helpers/withDefaultServices';
-import type { IResolveImportsAction } from '../transform/types';
+import type {
+  IGetExportsAction,
+  IResolveImportsAction,
+  Services,
+} from '../transform/types';
 import { EventEmitter, type EntrypointEvent } from '../utils/EventEmitter';
 
 const extensions = [
@@ -126,7 +130,8 @@ const runEntrypoint = (
   filename: string,
   cache: TransformCacheCollection,
   eventEmitter: EventEmitter,
-  resolve = createResolver(root)
+  resolve = createResolver(root),
+  onGetExports?: (services: Services) => void
 ) => {
   const services = createServices(root, filename, cache, eventEmitter);
   const entrypoint = Entrypoint.createRoot(
@@ -141,6 +146,10 @@ const runEntrypoint = (
 
   const handlers = {
     ...baseProcessingHandlers,
+    getExports(this: IGetExportsAction) {
+      onGetExports?.(this.services);
+      return baseProcessingHandlers.getExports.call(this);
+    },
     processEntrypoint,
     resolveImports(this: IResolveImportsAction) {
       return syncResolveImports.call(this, resolve);
@@ -351,15 +360,28 @@ describe('barrel optimization', () => {
         `export * from './mid';\nexport { thing } from './mid';\n`
       );
 
+      const cache = new TransformCacheCollection();
+      const recorder = createRecorder();
+      const getExportsServices: Services[] = [];
       const entrypoint = runEntrypoint(
         root,
         consumerFile,
-        new TransformCacheCollection(),
-        createRecorder().eventEmitter
+        cache,
+        recorder.eventEmitter,
+        createResolver(root),
+        (services) => getExportsServices.push(services)
       );
 
       expect(entrypoint.transformedCode).toContain(baseFile);
       expect(entrypoint.transformedCode).not.toContain(midFile);
+      expect(getExportsServices.length).toBeGreaterThan(0);
+      expect(
+        getExportsServices.every(
+          (services) =>
+            services.cache !== cache &&
+            services.eventEmitter === EventEmitter.dummy
+        )
+      ).toBe(true);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

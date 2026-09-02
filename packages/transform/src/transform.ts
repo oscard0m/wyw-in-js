@@ -106,7 +106,8 @@ const executeTransform = async (
       'workflow',
       undefined,
       null,
-      actionContext
+      actionContext,
+      services
     );
 
     const result = await asyncActionRunner(workflowAction, {

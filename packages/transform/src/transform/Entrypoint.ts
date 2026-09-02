@@ -210,7 +210,7 @@ export class Entrypoint extends BaseEntrypoint {
 
   private actionsCache: Map<
     ActionTypes,
-    Map<unknown, Map<unknown, BaseAction<ActionQueueItem>>>
+    Map<unknown, Map<unknown, WeakMap<Services, BaseAction<ActionQueueItem>>>>
   > = new Map();
 
   // Tracks how many times resolveImports has settled with `resolved: null`
@@ -575,7 +575,10 @@ export class Entrypoint extends BaseEntrypoint {
             cached.only,
             mergedOnly
           );
-          return [isLoop ? 'loop' : 'created', cached.supersede(mergedOnly)];
+          return [
+            isLoop ? 'loop' : 'created',
+            cached.supersede(mergedOnly, services),
+          ];
         }
 
         cached.deferOnlySupersede(mergedOnly);
@@ -587,7 +590,10 @@ export class Entrypoint extends BaseEntrypoint {
         return [isLoop ? 'loop' : 'cached', cached];
       }
 
-      return [isLoop ? 'loop' : 'created', cached.supersede(mergedOnly)];
+      return [
+        isLoop ? 'loop' : 'created',
+        cached.supersede(mergedOnly, services),
+      ];
     }
 
     if (cached) {
@@ -660,7 +666,7 @@ export class Entrypoint extends BaseEntrypoint {
 
     if (cached && !cached.evaluated) {
       cached.log('is cached, but with different code');
-      cached.supersede(newEntrypoint);
+      cached.supersede(newEntrypoint, services);
     }
 
     return ['created', newEntrypoint];
@@ -704,7 +710,7 @@ export class Entrypoint extends BaseEntrypoint {
     this.resolveTasks.set(name, tracked);
   }
 
-  public applyDeferredSupersede() {
+  public applyDeferredSupersede(services: Services = this.services) {
     if (this.#supersededWith || this.#pendingOnly === null) {
       return null;
     }
@@ -718,8 +724,8 @@ export class Entrypoint extends BaseEntrypoint {
 
     this.log('apply deferred supersede (%o -> %o)', this.only, mergedOnly);
 
-    const nextEntrypoint = this.supersede(mergedOnly);
-    this.services.cache.add('entrypoints', this.name, nextEntrypoint);
+    const nextEntrypoint = this.supersede(mergedOnly, services);
+    services.cache.add('entrypoints', this.name, nextEntrypoint);
 
     return nextEntrypoint;
   }
@@ -764,7 +770,8 @@ export class Entrypoint extends BaseEntrypoint {
     actionType: TType,
     data: TAction['data'],
     abortSignal: AbortSignal | null = null,
-    actionContext: unknown = DEFAULT_ACTION_CONTEXT
+    actionContext: unknown = DEFAULT_ACTION_CONTEXT,
+    services: Services = this.services
   ): BaseAction<TAction> {
     const actionContextOwners = getActionContextOwners(actionContext);
     if (actionContextOwners && !actionContextOwners.has(this)) {
@@ -781,23 +788,28 @@ export class Entrypoint extends BaseEntrypoint {
     }
 
     const cache = contexts.get(actionContext)!;
-    const cached = cache.get(data);
+    if (!cache.has(data)) {
+      cache.set(data, new WeakMap());
+    }
+
+    const serviceScopes = cache.get(data)!;
+    const cached = serviceScopes.get(services);
     if (cached && !cached.abortSignal?.aborted) {
       return cached as BaseAction<TAction>;
     }
 
     const newAction = new BaseAction<TAction>(
       actionType as TAction['type'],
-      this.services,
+      services,
       this,
       data,
       abortSignal,
       actionContext
     );
 
-    cache.set(data, newAction);
+    serviceScopes.set(services, newAction);
 
-    this.services.eventEmitter.entrypointEvent(this.seqId, {
+    services.eventEmitter.entrypointEvent(this.seqId, {
       type: 'actionCreated',
       actionType,
       actionIdx: newAction.idx,
@@ -818,20 +830,21 @@ export class Entrypoint extends BaseEntrypoint {
   public createChild(
     name: string,
     only: string[],
-    loadedCode?: string
+    loadedCode?: string,
+    services: Services = this.services
   ): Entrypoint | 'loop' {
     this.assertNotSuperseded();
-    return Entrypoint.create(this.services, this, name, only, loadedCode, {
+    return Entrypoint.create(services, this, name, only, loadedCode, {
       graphTraversalToken: this.unknownGraphTraversalToken,
     });
   }
 
-  public createEvaluated() {
+  public createEvaluated(services: Services = this.services) {
     const evaluatedOnly = mergeOnly(this.evaluatedOnly, this.only);
     this.log('create EvaluatedEntrypoint for %o', evaluatedOnly);
 
     const evaluated = new EvaluatedEntrypoint(
-      this.services,
+      services,
       evaluatedOnly,
       this.exportsProxy,
       this.generation + 1,
@@ -923,7 +936,10 @@ export class Entrypoint extends BaseEntrypoint {
     };
   }
 
-  public setTransformResult(res: ITransformFileResult | null) {
+  public setTransformResult(
+    res: ITransformFileResult | null,
+    services: Services = this.services
+  ) {
     this.#hasTransformResult = true;
     this.#hasWywMetadata = Boolean(res?.metadata);
     this.#transformResultCode = res?.code ?? null;
@@ -931,10 +947,10 @@ export class Entrypoint extends BaseEntrypoint {
     // A completed transform releases the superseded generations that led to
     // it. A later dependency rebuild is a new lineage and must get its own
     // diagnostic budget instead of inheriting a nearly-full storm window.
-    this.services.cache.completeUnknownGraphRecovery(this.name, this);
-    resetSupersedeWindow(this.services, this.name);
+    services.cache.completeUnknownGraphRecovery(this.name, this);
+    resetSupersedeWindow(services, this.name);
 
-    this.services.eventEmitter.entrypointEvent(this.seqId, {
+    services.eventEmitter.entrypointEvent(this.seqId, {
       isNull: res === null,
       type: 'setTransformResult',
     });
@@ -957,12 +973,15 @@ export class Entrypoint extends BaseEntrypoint {
       : [...only];
   }
 
-  private supersede(newOnlyOrEntrypoint: string[] | Entrypoint): Entrypoint {
+  private supersede(
+    newOnlyOrEntrypoint: string[] | Entrypoint,
+    services: Services = this.services
+  ): Entrypoint {
     this.#pendingOnly = null;
     const widensOnly = !(newOnlyOrEntrypoint instanceof Entrypoint);
     const newEntrypoint = widensOnly
       ? new Entrypoint(
-          this.services,
+          services,
           this.parents,
           this.initialCode,
           this.name,
@@ -980,7 +999,7 @@ export class Entrypoint extends BaseEntrypoint {
         )
       : newOnlyOrEntrypoint;
 
-    this.services.eventEmitter.entrypointEvent(this.seqId, {
+    services.eventEmitter.entrypointEvent(this.seqId, {
       type: 'superseded',
       with: newEntrypoint.seqId,
     });
