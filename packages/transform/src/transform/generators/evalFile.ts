@@ -28,6 +28,8 @@ export async function* evalFile(
       filename,
       strategy,
       staticDependencies: preevalResult.staticDependencies,
+      staticNullWYWMetaExtendsHelpers:
+        preevalResult.staticNullWYWMetaExtendsHelpers,
       staticValues: preevalResult.staticValueCache,
     });
     log(`<< skipped evaluate __wywPreval %O`, prevalPayload.values);
@@ -72,6 +74,8 @@ export async function* evalFile(
     filename,
     strategy,
     staticDependencies: preevalResult?.staticDependencies,
+    staticNullWYWMetaExtendsHelpers:
+      preevalResult?.staticNullWYWMetaExtendsHelpers,
     staticValues: preevalResult?.staticValueCache,
   });
 
