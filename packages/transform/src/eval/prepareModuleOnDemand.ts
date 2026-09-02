@@ -1,6 +1,7 @@
 import { oxcShaker } from '../shaker';
 import type { Services } from '../transform/types';
 import { Entrypoint } from '../transform/Entrypoint';
+import { isSuperSet } from '../transform/Entrypoint.helpers';
 import { collectOxcImportMap } from '../utils/oxcImportMap';
 import { prepareCodeForEvalRuntime } from '../transform/generators/transform';
 import type { EvalPreparationToken } from '../debug/evalTelemetry.types';
@@ -15,11 +16,17 @@ export function prepareModuleOnDemand(
   services: Services,
   id: string,
   only: string[],
-  telemetry?: EvalPreparationToken
+  telemetry?: EvalPreparationToken,
+  graphTraversalToken?: object,
+  activeEntrypoint?: Entrypoint
 ): PreparedModule {
-  const entrypoint = Entrypoint.createRoot(services, id, only, undefined, {
-    mergeCachedOnly: !only.includes('__wywPreval'),
-  });
+  const entrypoint =
+    activeEntrypoint?.name === id && isSuperSet(activeEntrypoint.only, only)
+      ? activeEntrypoint
+      : Entrypoint.createRoot(services, id, only, undefined, {
+          mergeCachedOnly: !only.includes('__wywPreval'),
+          graphTraversalToken,
+        });
 
   if (entrypoint.ignored) {
     const code = entrypoint.loadedAndParsed.code ?? '';

@@ -49,6 +49,7 @@ export function* getExports(
   const { loadedAndParsed } = entrypoint;
 
   entrypoint.log('get exports from %s', entrypoint.name);
+  entrypoint.assertNotSuperseded();
 
   if (cache.has('exports', entrypoint.name)) {
     return cache.get('exports', entrypoint.name)!;
@@ -104,6 +105,7 @@ export function* getExports(
       result.push(...childExports);
     }
 
+    entrypoint.assertNotSuperseded();
     cache.add('exports', entrypoint.name, result);
     cache.setCacheDependencies('exports', entrypoint.name, dependencyFilenames);
 
@@ -113,6 +115,7 @@ export function* getExports(
   }
 
   entrypoint.log('exports: %o', result);
+  entrypoint.assertNotSuperseded();
   cache.add('exports', entrypoint.name, result);
 
   return result;

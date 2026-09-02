@@ -450,7 +450,13 @@ type PendingRequest = {
   timeout: ReturnType<typeof setTimeout>;
 };
 
+type CacheGeneration = {
+  invalidationError: Error | null;
+};
+
 type EvalRequestContext = {
+  cacheGeneration: CacheGeneration;
+  entrypoint: Entrypoint | null;
   epoch: number;
   inputQueue: WriteQueue;
   runner: ChildProcessWithoutNullStreams;
@@ -478,8 +484,9 @@ type EvalFileDebugLine = {
 };
 
 type PendingEval = {
+  cacheGeneration: CacheGeneration;
   entrypoint: Entrypoint;
-  services: Services | undefined;
+  services: Services;
   telemetry: EvalTelemetryToken | undefined;
   resolve: (value: EvaluateResult) => void;
   reject: (reason?: unknown) => void;
@@ -1087,13 +1094,14 @@ const encodeGlobalsCached = (input: unknown): Record<string, unknown> => {
 // reference to the cache.
 const transformCacheSessionTokens = new WeakMap<
   TransformCacheCollection,
-  object
+  { lifecycleVersion: number; token: object }
 >();
 const getTransformCacheSessionToken = (cache: TransformCacheCollection) => {
+  const lifecycleVersion = cache.getLifecycleVersion();
   const cached = transformCacheSessionTokens.get(cache);
-  if (cached) return cached;
+  if (cached?.lifecycleVersion === lifecycleVersion) return cached.token;
   const token = {};
-  transformCacheSessionTokens.set(cache, token);
+  transformCacheSessionTokens.set(cache, { lifecycleVersion, token });
   return token;
 };
 
@@ -1141,6 +1149,11 @@ export class EvalBroker {
 
   private requestEpoch = 0;
 
+  private readonly cacheGenerations = new WeakMap<
+    TransformCacheCollection,
+    CacheGeneration
+  >();
+
   private nextRunnerSessionId = 0;
 
   private activeRunnerSessionId = 0;
@@ -1158,6 +1171,8 @@ export class EvalBroker {
   private semanticSessionKey: string | Services | undefined;
 
   private semanticSessionCacheToken: object | undefined;
+
+  private semanticSessionCacheGeneration: CacheGeneration | undefined;
 
   private evalQueue: Promise<void> = Promise.resolve();
 
@@ -1217,6 +1232,10 @@ export class EvalBroker {
   // evalQueue chain + state-clear churn.
   private pendingEvals: PendingEval[] = [];
 
+  private readonly unsettledEvals = new Set<PendingEval>();
+
+  private readonly evalsWithStartedTelemetry = new WeakSet<PendingEval>();
+
   private evalFlushScheduled = false;
 
   // Cached stable init payload hash. Keyed on the refs that feed the stable
@@ -1241,6 +1260,8 @@ export class EvalBroker {
   private happyDomDisableWarned = false;
 
   private activeResolveRootId: string | null = null;
+
+  private activeEntrypoint: Entrypoint | null = null;
 
   private activeEvalTelemetry: EvalTelemetryToken | undefined;
 
@@ -1420,13 +1441,16 @@ export class EvalBroker {
         }))
       : undefined;
     return new Promise<EvaluateResult>((resolve, reject) => {
-      this.pendingEvals.push({
+      const pendingEval: PendingEval = {
+        cacheGeneration: this.getCacheGeneration(activeServices.cache),
         entrypoint,
-        services,
+        services: activeServices,
         telemetry,
         resolve,
         reject,
-      });
+      };
+      this.pendingEvals.push(pendingEval);
+      this.unsettledEvals.add(pendingEval);
       this.scheduleEvalFlush();
     });
   }
@@ -1443,46 +1467,59 @@ export class EvalBroker {
     });
   }
 
+  private startPendingEval(
+    member: PendingEval,
+    batchIndex: number,
+    batchSize: number
+  ): void {
+    if (this.evalsWithStartedTelemetry.has(member)) return;
+    this.evalsWithStartedTelemetry.add(member);
+    member.telemetry?.start({ batchIndex, batchSize });
+  }
+
+  private resolvePendingEval(
+    member: PendingEval,
+    result: EvaluateResult
+  ): void {
+    if (!this.unsettledEvals.delete(member)) return;
+    member.telemetry?.finish(
+      result.values ? 'success' : 'no-values',
+      this.loadMirror.snapshot()
+    );
+    member.resolve(result);
+  }
+
+  private rejectPendingEval(member: PendingEval, error: unknown): void {
+    if (!this.unsettledEvals.delete(member)) return;
+    member.telemetry?.finish('error', this.loadMirror.snapshot());
+    member.reject(error);
+  }
+
   private async runEvalBatch(batch: PendingEval[]): Promise<void> {
     try {
-      try {
-        this.currentServices = batch[0].services ?? this.currentServices;
-        await this.ensureRunner();
-      } catch (error) {
-        for (const [batchIndex, member] of batch.entries()) {
-          member.telemetry?.start({ batchIndex, batchSize: batch.length });
-          member.telemetry?.finish('error', this.loadMirror.snapshot());
-          member.reject(error);
-        }
-        return;
-      }
-      let runnerRecoveryRequired = false;
       for (const [batchIndex, member] of batch.entries()) {
+        if (!this.unsettledEvals.has(member)) continue;
         const { telemetry } = member;
-        telemetry?.start({ batchIndex, batchSize: batch.length });
+        this.startPendingEval(member, batchIndex, batch.length);
         this.activeEvalTelemetry = telemetry;
         try {
           if (this.disposed) {
             throw new Error('[wyw-in-js] Eval broker has been disposed');
           }
-          if (runnerRecoveryRequired) {
-            this.currentServices = member.services ?? this.currentServices;
-            runnerRecoveryRequired = false;
-            await this.ensureRunner();
-          }
+          this.assertCacheGeneration(
+            member.services.cache,
+            member.cacheGeneration,
+            member.entrypoint
+          );
+          this.currentServices = member.services;
           const result = await this.runOneEntrypoint(
             member.entrypoint,
-            member.services
+            member.services,
+            member.cacheGeneration
           );
-          telemetry?.finish(
-            result.values ? 'success' : 'no-values',
-            this.loadMirror.snapshot()
-          );
-          member.resolve(result);
+          this.resolvePendingEval(member, result);
         } catch (error) {
-          runnerRecoveryRequired = !this.disposed && this.runner === null;
-          telemetry?.finish('error', this.loadMirror.snapshot());
-          member.reject(error);
+          this.rejectPendingEval(member, error);
         } finally {
           if (this.activeEvalTelemetry === telemetry) {
             this.activeEvalTelemetry = undefined;
@@ -1496,9 +1533,14 @@ export class EvalBroker {
 
   private async runOneEntrypoint(
     entrypoint: Entrypoint,
-    services: Services | undefined
+    activeServices: Services,
+    cacheGeneration: CacheGeneration
   ): Promise<EvaluateResult> {
-    const activeServices = services ?? this.currentServices;
+    this.assertCacheGeneration(
+      activeServices.cache,
+      cacheGeneration,
+      entrypoint
+    );
     const resolveRootId = getEntrypointResolveRoot(entrypoint);
     this.currentServices = activeServices;
     // configureEvalSession always provides a hash. Direct EvalBroker users
@@ -1512,7 +1554,8 @@ export class EvalBroker {
     const reuseModules =
       this.hasSemanticSession &&
       this.semanticSessionKey === nextSemanticSessionKey &&
-      this.semanticSessionCacheToken === nextSemanticSessionCacheToken;
+      this.semanticSessionCacheToken === nextSemanticSessionCacheToken &&
+      this.semanticSessionCacheGeneration === cacheGeneration;
     if (!reuseModules) {
       this.resetSemanticSessionState();
     }
@@ -1521,7 +1564,9 @@ export class EvalBroker {
     this.hasSemanticSession = false;
     this.semanticSessionKey = undefined;
     this.semanticSessionCacheToken = undefined;
+    this.semanticSessionCacheGeneration = undefined;
     this.activeResolveRootId = resolveRootId;
+    this.activeEntrypoint = entrypoint;
     this.resetPerEntrypointState(entrypoint);
     this.evalSeq += 1;
     this.evalFileDebugLines = activeServices.eventEmitter.enabled ? [] : null;
@@ -1536,15 +1581,39 @@ export class EvalBroker {
     }
 
     try {
-      await this.initRunner(entrypoint, reuseModules);
+      // Mark this cache as active before waiting for a runner. A reset from
+      // the previous batch member must not retire a runner that this member is
+      // already preparing to reinitialize for its own semantic session.
+      await this.ensureRunner();
+      this.assertCacheGeneration(
+        activeServices.cache,
+        cacheGeneration,
+        entrypoint
+      );
+      await this.initRunner(entrypoint, reuseModules, cacheGeneration);
+      this.assertCacheGeneration(
+        activeServices.cache,
+        cacheGeneration,
+        entrypoint
+      );
       this.hasSemanticSession = true;
       this.semanticSessionKey = nextSemanticSessionKey;
       this.semanticSessionCacheToken = nextSemanticSessionCacheToken;
+      this.semanticSessionCacheGeneration = cacheGeneration;
 
       const payload = await this.request<EvalResultPayload>(
         'EVAL',
         { id: entrypoint.name },
         EVAL_TIMEOUT_MS
+      );
+
+      // The cache can be invalidated while the runner is evaluating. Do not
+      // let a response from the superseded generation publish module exports
+      // into the replacement entrypoint's shared cache.
+      this.assertCacheGeneration(
+        activeServices.cache,
+        cacheGeneration,
+        entrypoint
       );
 
       this.flushEvalFileDebugLines(payload.debugEvalFiles);
@@ -1582,6 +1651,7 @@ export class EvalBroker {
       this.hasSemanticSession = false;
       this.semanticSessionKey = undefined;
       this.semanticSessionCacheToken = undefined;
+      this.semanticSessionCacheGeneration = undefined;
       const failedRunner = this.runner;
       if (failedRunner) {
         this.retireRunner(
@@ -1595,6 +1665,9 @@ export class EvalBroker {
       this.evalFileDebugLines = null;
       if (this.activeResolveRootId === resolveRootId) {
         this.activeResolveRootId = null;
+      }
+      if (this.activeEntrypoint === entrypoint) {
+        this.activeEntrypoint = null;
       }
     }
   }
@@ -1764,6 +1837,7 @@ export class EvalBroker {
     this.hasSemanticSession = false;
     this.semanticSessionKey = undefined;
     this.semanticSessionCacheToken = undefined;
+    this.semanticSessionCacheGeneration = undefined;
     this.activeRunnerSessionId = 0;
     this.requestEpoch += 1;
     this.runnerOutputBuffer = '';
@@ -1779,33 +1853,141 @@ export class EvalBroker {
     this.disposed = true;
     this.recordBrokerLifecycle('broker-dispose-observed', reason, true);
     const error = new Error('[wyw-in-js] Eval broker has been disposed');
-    const queued = this.pendingEvals;
     this.pendingEvals = [];
-    for (const member of queued) {
-      member.reject(error);
+    const unsettled = [...this.unsettledEvals];
+    for (const [batchIndex, member] of unsettled.entries()) {
+      this.startPendingEval(member, batchIndex, unsettled.length);
+      this.rejectPendingEval(member, error);
     }
     if (this.runner) {
       this.retireRunner(this.runner, reason, error);
     } else {
+      this.requestEpoch += 1;
       this.rejectAllPending(error);
     }
-    for (const isolatedRunner of this.isolatedRunners) {
-      isolatedRunner.kill();
+    this.stopIsolatedRunners();
+    this.clearEvaluationState();
+    flushDebugStreams();
+  }
+
+  public resetAfterCacheInvalidation(
+    cache: TransformCacheCollection,
+    error: Error,
+    reason: 'supersede-storm' | 'unknown-dependency-graph'
+  ): void {
+    const invalidatedGeneration = this.getCacheGeneration(cache);
+    invalidatedGeneration.invalidationError = error;
+    this.cacheGenerations.set(cache, { invalidationError: null });
+
+    // Reject every unsettled evaluation from the discarded generation,
+    // including members already captured by runEvalBatch. Preserve work owned
+    // by other cache lifecycles: a scoped broker may serve several at once.
+    const invalidated = [...this.unsettledEvals].filter(
+      (member) => member.cacheGeneration === invalidatedGeneration
+    );
+    this.pendingEvals = this.pendingEvals.filter((member) =>
+      this.unsettledEvals.has(member)
+    );
+    for (const [batchIndex, member] of invalidated.entries()) {
+      this.startPendingEval(member, batchIndex, invalidated.length);
+      this.rejectPendingEval(member, error);
+    }
+
+    // A reset from cache A must not interrupt an active evaluation owned by
+    // cache B. An idle runner still owned by A is retired so asynchronous VM
+    // continuations from its old generation cannot reach A's replacement.
+    const ownsActiveEvaluation =
+      this.activeEntrypoint !== null && this.currentServices.cache === cache;
+    const ownsIdleSemanticSession =
+      this.activeEntrypoint === null &&
+      this.semanticSessionCacheGeneration === invalidatedGeneration;
+    if (!ownsActiveEvaluation && !ownsIdleSemanticSession) {
+      return;
+    }
+
+    // Do not wait behind evalQueue: a custom loader or resolver can remain
+    // pending far longer than the transform that invalidated it. Advance the
+    // runner generation first, then reject EVAL/INIT and stop the process so
+    // the active batch settles immediately. Async LOAD/RESOLVE continuations
+    // capture their generation and response queue; they cannot commit state or
+    // write a late response into the replacement runner.
+    this.requestEpoch += 1;
+    this.recordBrokerLifecycle(
+      'broker-dispose-observed',
+      `cache-invalidation:${reason}`,
+      true
+    );
+    this.rejectAllPending(error);
+    this.stopRunner(`cache-invalidation:${reason}`);
+    this.stopIsolatedRunners();
+    this.clearEvaluationState();
+    flushDebugStreams();
+  }
+
+  private stopRunner(reason: string): void {
+    const { runner } = this;
+    if (!runner) return;
+    this.recordBrokerLifecycle('runner-stop-requested', reason, true);
+    this.runner = null;
+    this.runnerReady = null;
+    this.runnerInputQueue = null;
+    this.activeRunnerSessionId = 0;
+    runner.removeAllListeners();
+    runner.kill();
+  }
+
+  private stopIsolatedRunners(): void {
+    for (const runner of this.isolatedRunners) {
+      runner.kill();
     }
     this.isolatedRunners.clear();
+  }
+
+  private assertCacheGeneration(
+    cache: TransformCacheCollection,
+    generation: CacheGeneration,
+    entrypoint?: Entrypoint | null
+  ): void {
+    if (generation !== this.getCacheGeneration(cache)) {
+      throw (
+        generation.invalidationError ??
+        new Error('[wyw-in-js] Evaluation cache generation was invalidated')
+      );
+    }
+    entrypoint?.assertNotSuperseded();
+  }
+
+  private getCacheGeneration(cache: TransformCacheCollection): CacheGeneration {
+    const current = this.cacheGenerations.get(cache);
+    if (current) return current;
+    const created = { invalidationError: null };
+    this.cacheGenerations.set(cache, created);
+    return created;
+  }
+
+  private clearEvaluationState(): void {
     this.lastInitKey = null;
     this.lastHappyDomEnabled = false;
     this.hasSemanticSession = false;
     this.semanticSessionKey = undefined;
     this.semanticSessionCacheToken = undefined;
+    this.semanticSessionCacheGeneration = undefined;
     this.activeRunnerSessionId = 0;
-    this.requestEpoch += 1;
-    this.runnerOutputBuffer = '';
+    this.activeResolveRootId = null;
+    this.activeEntrypoint = null;
+    this.resolveCache.clear();
+    this.resolveInFlight.clear();
+    this.loadCache.clear();
+    this.loadInFlight.clear();
+    this.importsByModule.clear();
+    this.onlyByModule.clear();
+    this.runtimeDependenciesByModule.clear();
+    this.emittedDependencies.clear();
     this.loadMirror.clear();
     this.pendingModuleResets.clear();
     this.sessionLinkGraph.clear();
     this.stableInitHashCache = null;
-    flushDebugStreams();
+    this.runnerOutputBuffer = '';
   }
 
   private createRunnerProcess(reason: string): ChildProcessWithoutNullStreams {
@@ -1859,6 +2041,7 @@ export class EvalBroker {
       this.hasSemanticSession = false;
       this.semanticSessionKey = undefined;
       this.semanticSessionCacheToken = undefined;
+      this.semanticSessionCacheGeneration = undefined;
       this.activeRunnerSessionId = 0;
       this.requestEpoch += 1;
       this.runnerOutputBuffer = '';
@@ -1869,29 +2052,52 @@ export class EvalBroker {
   }
 
   private async ensureRunner() {
-    if (this.disposed) {
-      throw new Error('[wyw-in-js] Eval broker has been disposed');
-    }
-    if (this.runnerReady) {
-      await this.runnerReady;
+    for (;;) {
       if (this.disposed) {
         throw new Error('[wyw-in-js] Eval broker has been disposed');
       }
+
+      const existingReady = this.runnerReady;
+      if (existingReady) {
+        const existingRunner = this.runner;
+        const existingInputQueue = this.runnerInputQueue;
+        await existingReady;
+        if (this.disposed) {
+          throw new Error('[wyw-in-js] Eval broker has been disposed');
+        }
+        if (
+          existingReady === this.runnerReady &&
+          existingRunner !== null &&
+          existingRunner === this.runner &&
+          existingInputQueue !== null &&
+          existingInputQueue === this.runnerInputQueue
+        ) {
+          return;
+        }
+        continue;
+      }
+
+      const runner = this.createRunnerProcess('ensure');
+      const inputQueue = createWriteQueue(runner.stdin, 'eval runner stdin');
+      this.runner = runner;
+      this.runnerInputQueue = inputQueue;
+      this.attachRunnerListeners(runner);
+      const runnerReady = Promise.resolve();
+      this.runnerReady = runnerReady;
+      await runnerReady;
+      if (this.disposed) {
+        throw new Error('[wyw-in-js] Eval broker has been disposed');
+      }
+      if (
+        runnerReady !== this.runnerReady ||
+        runner !== this.runner ||
+        inputQueue !== this.runnerInputQueue
+      ) {
+        continue;
+      }
+      this.recordBrokerLifecycle('runner-activated', 'ensure');
       return;
     }
-
-    this.runner = this.createRunnerProcess('ensure');
-    this.runnerInputQueue = createWriteQueue(
-      this.runner.stdin,
-      'eval runner stdin'
-    );
-    this.attachRunnerListeners(this.runner);
-    this.runnerReady = Promise.resolve();
-    await this.runnerReady;
-    if (this.disposed) {
-      throw new Error('[wyw-in-js] Eval broker has been disposed');
-    }
-    this.recordBrokerLifecycle('runner-activated', 'ensure');
   }
 
   private async initIsolatedRunner(
@@ -2080,7 +2286,13 @@ export class EvalBroker {
     return hash;
   }
 
-  private async initRunner(entrypoint: Entrypoint, reuseModules = true) {
+  private async initRunner(
+    entrypoint: Entrypoint,
+    reuseModules = true,
+    cacheGeneration = this.getCacheGeneration(this.currentServices.cache)
+  ) {
+    const { cache } = this.currentServices;
+    this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
     const features = this.getRunnerFeatures();
     const stableHash = this.getStableInitHash(this.currentServices, features);
     const debugEvalFiles = this.currentServices.eventEmitter.enabled;
@@ -2115,9 +2327,14 @@ export class EvalBroker {
           candidateSession.payload,
           timeoutMs
         );
-        if (this.disposed) {
+        try {
+          this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
+          if (this.disposed) {
+            throw new Error('[wyw-in-js] Eval broker has been disposed');
+          }
+        } catch (error) {
           nextRunner.kill();
-          throw new Error('[wyw-in-js] Eval broker has been disposed');
+          throw error;
         }
         this.replaceRunner(nextRunner);
         this.activeRunnerSessionId = candidateSession.sessionId;
@@ -2125,6 +2342,7 @@ export class EvalBroker {
         this.lastHappyDomEnabled = true;
         return;
       } catch (error) {
+        this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
         if (isEvalTimeoutError(error)) {
           this.happyDomDisabled = true;
           this.warnHappyDomDisabledOnce(timeoutMs);
@@ -2139,6 +2357,7 @@ export class EvalBroker {
             fallbackPayload.debugEvalFiles = true;
           }
           await this.initActiveRunner(fallbackPayload, INIT_TIMEOUT_MS);
+          this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
           this.lastInitKey = `${this.getStableInitHash(
             this.currentServices,
             fallbackFeatures
@@ -2153,6 +2372,7 @@ export class EvalBroker {
 
     try {
       await this.initActiveRunner(payload, timeoutMs);
+      this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
       this.lastInitKey = initKey;
       this.lastHappyDomEnabled = nextHappyDomEnabled;
     } catch (error) {
@@ -2172,6 +2392,7 @@ export class EvalBroker {
           );
         }
         await this.ensureRunner();
+        this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
         const fallbackFeatures = this.getRunnerFeatures();
         const fallbackPayload = buildRunnerInitPayload(
           this.currentServices,
@@ -2183,6 +2404,7 @@ export class EvalBroker {
           fallbackPayload.debugEvalFiles = true;
         }
         await this.initActiveRunner(fallbackPayload, INIT_TIMEOUT_MS);
+        this.assertCacheGeneration(cache, cacheGeneration, entrypoint);
         this.lastInitKey = `${this.getStableInitHash(
           this.currentServices,
           fallbackFeatures
@@ -2239,7 +2461,6 @@ export class EvalBroker {
     if (this.runner !== runner) {
       return;
     }
-
     const next = `${this.runnerOutputBuffer}${chunk}`;
     const lines = next.split('\n');
     this.runnerOutputBuffer = lines.pop() ?? '';
@@ -2325,14 +2546,19 @@ export class EvalBroker {
         this.handleResolve(message.id, message.payload, context).catch(
           (error) => {
             if (!this.isRequestContextActive(context)) return;
-            void this.sendMessageForRequest(context, {
-              type: 'RESOLVE_RESULT',
-              id: message.id,
-              payload: {
-                resolvedId: null,
-                error: toSerializedError(error),
+            void this.sendMessageForRequest(
+              context,
+              {
+                type: 'RESOLVE_RESULT',
+                id: message.id,
+                payload: {
+                  resolvedId: null,
+                  error: toSerializedError(error),
+                },
               },
-            }).catch((sendError) => {
+              undefined,
+              true
+            ).catch((sendError) => {
               if (this.isRequestContextActive(context)) {
                 this.handleSendMessageError(sendError);
               }
@@ -2359,7 +2585,8 @@ export class EvalBroker {
               },
               telemetry
                 ? { details: { mode: 'error' }, token: telemetry }
-                : undefined
+                : undefined,
+              true
             ).catch((sendError) => {
               if (this.isRequestContextActive(context)) {
                 this.handleSendMessageError(sendError);
@@ -2391,6 +2618,8 @@ export class EvalBroker {
     }
 
     return {
+      cacheGeneration: this.getCacheGeneration(this.currentServices.cache),
+      entrypoint: this.activeEntrypoint,
       epoch: this.requestEpoch,
       inputQueue,
       runner,
@@ -2405,10 +2634,13 @@ export class EvalBroker {
     if (!context) return true;
     return (
       context.epoch === this.requestEpoch &&
+      context.cacheGeneration ===
+        this.getCacheGeneration(context.services.cache) &&
       context.runner === this.runner &&
       context.sessionId === this.activeRunnerSessionId &&
       context.services === this.currentServices &&
-      context.inputQueue === this.runnerInputQueue
+      context.inputQueue === this.runnerInputQueue &&
+      context.entrypoint === this.activeEntrypoint
     );
   }
 
@@ -2416,12 +2648,16 @@ export class EvalBroker {
     context: EvalRequestContext | undefined
   ): void {
     if (!this.isRequestContextActive(context)) {
+      if (context?.cacheGeneration.invalidationError) {
+        throw context.cacheGeneration.invalidationError;
+      }
       const error = new Error(
         '[wyw-in-js] Ignoring a stale eval runner request'
       );
       error.name = 'StaleEvalRequestError';
       throw error;
     }
+    context?.entrypoint?.assertNotSuperseded();
   }
 
   private handleRunnerStderr(chunk: Buffer) {
@@ -2452,6 +2688,7 @@ export class EvalBroker {
     payload: ResolveRequestPayload,
     context?: EvalRequestContext
   ) {
+    this.assertRequestContextActive(context);
     const result = await this.resolveImport(payload, context);
     this.assertRequestContextActive(context);
 
@@ -3186,6 +3423,7 @@ export class EvalBroker {
     telemetry = this.activeEvalTelemetry,
     context?: EvalRequestContext
   ) {
+    this.assertRequestContextActive(context);
     telemetry?.recordLoadRequest();
     const prepared = await this.loadModule(payload, telemetry, context);
     this.assertRequestContextActive(context);
@@ -3337,6 +3575,7 @@ export class EvalBroker {
       `${actionEntrypoint}\0${id}`,
       actionEntrypoint,
       () => {
+        this.assertRequestContextActive(context);
         const predecessor = this.loadInFlight.get(id);
         if (!predecessor) {
           // Cache and serialized-export hits have no asynchronous critical
@@ -3386,6 +3625,7 @@ export class EvalBroker {
   ): Promise<PreparedCacheEntry & { resetModule?: true }> {
     this.assertRequestContextActive(context);
     const services = context?.services ?? this.currentServices;
+    const evaluatedEntrypoint = context?.entrypoint ?? this.activeEntrypoint;
     let cached = this.loadCache.get(id);
     const invalidated = services.cache.consumeInvalidation(id);
     if (invalidated) {
@@ -3590,7 +3830,11 @@ export class EvalBroker {
         };
       }
 
-      if (!requiredOnly.includes('*')) {
+      // Widening the evaluated entrypoint from __wywPreval to `*` would
+      // supersede the caller while its EVAL is in flight. Dependencies can
+      // still take this static fast path, but the active entrypoint must retain
+      // the generation whose result is about to be published and checked.
+      if (id !== evaluatedEntrypoint?.name && !requiredOnly.includes('*')) {
         const loadedAndParsed = services.loadAndParseFn(
           services,
           id,
@@ -3621,10 +3865,19 @@ export class EvalBroker {
                 services,
                 id,
                 prepareOnly,
-                preparationTelemetry
+                preparationTelemetry,
+                evaluatedEntrypoint?.graphTraversalToken,
+                evaluatedEntrypoint ?? undefined
               )
             )
-          : prepareModuleOnDemand(services, id, prepareOnly);
+          : prepareModuleOnDemand(
+              services,
+              id,
+              prepareOnly,
+              undefined,
+              evaluatedEntrypoint?.graphTraversalToken,
+              evaluatedEntrypoint ?? undefined
+            );
       } catch (error) {
         preparationTelemetry?.fail();
         throw error;
@@ -3722,30 +3975,42 @@ export class EvalBroker {
     context: EvalRequestContext | undefined,
     id: string,
     payload: Omit<LoadResultPayload, 'chunkIndex' | 'chunkCount' | 'codeChunk'>,
-    telemetry?: LoadTransmissionTelemetry
+    telemetry?: LoadTransmissionTelemetry,
+    allowSuperseded = false
   ): Promise<void> {
-    if (!context) {
-      return this.sendLoadResult(id, payload, telemetry);
-    }
+    if (!context) return this.sendLoadResult(id, payload, telemetry);
     return sendEvalLoadResult(id, payload, telemetry, (message, onSerialized) =>
-      this.sendMessageForRequest(context, message, onSerialized)
+      this.sendMessageForRequest(
+        context,
+        message,
+        onSerialized,
+        allowSuperseded
+      )
     );
   }
 
   private sendMessageForRequest(
     context: EvalRequestContext | undefined,
     message: MainToRunnerMessage,
-    onSerialized?: (bytes: number) => void
+    onSerialized?: (bytes: number) => void,
+    allowSuperseded = false
   ): Promise<void> {
-    if (!context) {
-      return this.sendMessage(message, onSerialized);
+    if (!context) return this.sendMessage(message, onSerialized);
+    if (allowSuperseded) {
+      if (!this.isRequestContextActive(context)) {
+        if (context.cacheGeneration.invalidationError) {
+          throw context.cacheGeneration.invalidationError;
+        }
+        const error = new Error(
+          '[wyw-in-js] Ignoring a stale eval runner response'
+        );
+        error.name = 'StaleEvalRequestError';
+        throw error;
+      }
+    } else {
+      this.assertRequestContextActive(context);
     }
-    this.assertRequestContextActive(context);
-    return sendEvalMessage(
-      context?.inputQueue ?? this.runnerInputQueue,
-      message,
-      onSerialized
-    );
+    return sendEvalMessage(context.inputQueue, message, onSerialized);
   }
 
   private sendLoadResult(
@@ -3768,6 +4033,8 @@ export class EvalBroker {
     id?: string,
     runner: ChildProcessWithoutNullStreams | null = this.runner
   ) {
+    const runnerError =
+      error instanceof Error ? error : new Error(String(error));
     const serialized =
       error instanceof Error
         ? { message: error.message, stack: error.stack }
@@ -3777,12 +4044,9 @@ export class EvalBroker {
       this.rejectPending(id, serialized);
     }
 
-    if (runner) {
-      this.retireRunner(
-        runner,
-        'send-error',
-        error instanceof Error ? error : new Error(String(error))
-      );
+    if (runner && this.runner === runner) {
+      this.retireRunner(runner, 'send-error', runnerError);
+      this.clearEvaluationState();
     }
   }
 
@@ -3799,6 +4063,10 @@ export class EvalBroker {
       payload: payload as never,
     } as MainToRunnerMessage;
     const requestRunner = this.runner;
+    const requestContext = requestRunner
+      ? this.captureRequestContext(requestRunner, this.activeRunnerSessionId) ??
+        undefined
+      : undefined;
 
     return new Promise<TPayload>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -3819,9 +4087,12 @@ export class EvalBroker {
         timeout,
       });
 
-      this.sendMessage(message).catch((error) =>
-        this.handleSendMessageError(error, id, requestRunner)
-      );
+      this.sendMessageForRequest(requestContext, message).catch((error) => {
+        if (requestContext && !this.isRequestContextActive(requestContext)) {
+          return;
+        }
+        this.handleSendMessageError(error, id, requestRunner);
+      });
     });
   }
 

@@ -595,7 +595,8 @@ export class Module {
       this.services,
       filename,
       reprocessOnly,
-      code
+      code,
+      { graphTraversalToken: this.entrypoint.graphTraversalToken }
     );
 
     if (newEntrypoint.evaluated) {
