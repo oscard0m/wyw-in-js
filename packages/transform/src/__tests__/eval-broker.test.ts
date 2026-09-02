@@ -948,6 +948,94 @@ describe('EvalBroker', () => {
     }
   });
 
+  it('answers a post-eval dynamic import resolve delivered in one chunk with EVAL_RESULT', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
+    const entry = join(root, 'entry.js');
+    const slowModule = join(root, 'slow.js');
+    const source = [
+      'export const __wywPreval = {',
+      '  value: () => {',
+      "    void import('slow');",
+      "    return 'first';",
+      '  },',
+      '};',
+    ].join('\n');
+    writeFileSync(entry, source);
+    writeFileSync(slowModule, "export const value = 'slow';");
+
+    let loads = 0;
+    let loadStarted!: () => void;
+    const loadStartedPromise = new Promise<void>((complete) => {
+      loadStarted = complete;
+    });
+    const services = createServices(root, entry, {
+      eval: {
+        customLoader: async (id) => {
+          if (id !== slowModule) return undefined;
+          loads += 1;
+          loadStarted();
+          return { code: "export const value = 'slow';" };
+        },
+      },
+    });
+    services.evalCacheKey = 'coalesced-semantics';
+    services.asyncResolve = async (what) =>
+      what === 'slow' ? slowModule : null;
+
+    const broker = new EvalBroker(services, services.asyncResolve);
+    const privateBroker = broker as unknown as {
+      onData: (runner: unknown, chunk: string) => void;
+    };
+
+    // Deliver runner stdout in coalesced chunks so the RESOLVE issued by the
+    // fire-and-forget import is processed in the same synchronous batch as
+    // EVAL_RESULT. This is what a busy CI host produces naturally.
+    const originalOnData = privateBroker.onData;
+    let coalesced = '';
+    let coalescedRunner: unknown;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    privateBroker.onData = (runner, chunk) => {
+      coalesced += chunk;
+      coalescedRunner = runner;
+      if (flushTimer) return;
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        const buffered = coalesced;
+        coalesced = '';
+        originalOnData.call(broker, coalescedRunner, buffered);
+      }, 5);
+    };
+
+    try {
+      const entrypoint = Entrypoint.createRoot(
+        services,
+        entry,
+        ['__wywPreval'],
+        source
+      );
+      expect(
+        (await broker.evaluate(entrypoint, services)).values?.get('value')
+      ).toBe('first');
+
+      // The dynamic import continuation belongs to the same semantic session
+      // and must still be served after EVAL_RESULT cleared the active
+      // entrypoint. Dropping RESOLVE_RESULT would leave the runner awaiting
+      // forever and this LOAD would never arrive.
+      const loaded = await Promise.race([
+        loadStartedPromise.then(() => true),
+        new Promise<false>((resolveTimeout) => {
+          setTimeout(() => resolveTimeout(false), 1000);
+        }),
+      ]);
+      expect(loaded).toBe(true);
+      expect(loads).toBe(1);
+    } finally {
+      if (flushTimer) clearTimeout(flushTimer);
+      broker.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not let a stale same-id load block the next entrypoint session', async () => {
     const root = mkdtempSync(join(tmpdir(), 'wyw-eval-broker-'));
     const firstEntry = join(root, 'first.js');
