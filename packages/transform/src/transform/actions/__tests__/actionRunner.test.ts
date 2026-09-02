@@ -44,6 +44,44 @@ describe('actionRunner', () => {
     expect(handlers.processEntrypoint).toHaveBeenCalled();
   });
 
+  it('separates cached nested actions by their service scope', () => {
+    const analysisServices = createServices();
+    const rootEntrypoint = createEntrypoint(services, '/foo/root.js', [
+      'default',
+    ]);
+    const analysisEntrypoint = createEntrypoint(
+      analysisServices,
+      '/foo/analysis.js',
+      ['default']
+    );
+    const captured: Services[] = [];
+    const handlers = getHandlers<'sync'>({
+      *workflow(this: IWorkflowAction) {
+        yield* this.getNext('transform', analysisEntrypoint, undefined, null);
+        yield* this.getNext(
+          'transform',
+          analysisEntrypoint,
+          undefined,
+          null,
+          analysisServices
+        );
+        return { code: '', sourceMap: null };
+      },
+      // eslint-disable-next-line require-yield
+      *transform(this: ITransformAction) {
+        captured.push(this.services);
+        return { code: '', metadata: null };
+      },
+    });
+
+    syncActionRunner(
+      rootEntrypoint.createAction('workflow', undefined, null),
+      handlers
+    );
+
+    expect(captured).toEqual([services, analysisServices]);
+  });
+
   it('should not run action if its copy was already run', async () => {
     const handler = jest.fn();
     function* handlerGenerator(

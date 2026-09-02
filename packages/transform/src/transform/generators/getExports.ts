@@ -3,7 +3,11 @@ import { collectOxcExportsAndImports } from '../../utils/collectOxcExportsAndImp
 import { oxcShaker } from '../../shaker';
 import type { Entrypoint } from '../Entrypoint';
 import type { IEntrypointDependency } from '../Entrypoint.types';
-import type { IGetExportsAction, SyncScenarioForAction } from '../types';
+import type {
+  IGetExportsAction,
+  Services,
+  SyncScenarioForAction,
+} from '../types';
 
 type WildcardReexport = {
   source: string;
@@ -11,7 +15,8 @@ type WildcardReexport = {
 
 export function findExportsInImports(
   entrypoint: Entrypoint,
-  imports: IEntrypointDependency[]
+  imports: IEntrypointDependency[],
+  services?: Services
 ): { entrypoint: Entrypoint; import: string }[] {
   const results: {
     entrypoint: Entrypoint;
@@ -24,7 +29,12 @@ export function findExportsInImports(
       throw new Error(`Could not resolve import ${imp.source}`);
     }
 
-    const newEntrypoint = entrypoint.createChild(resolved, []);
+    const newEntrypoint = entrypoint.createChild(
+      resolved,
+      [],
+      undefined,
+      services
+    );
 
     if (newEntrypoint === 'loop') {
       continue;
@@ -92,7 +102,8 @@ export function* getExports(
 
     const importedEntrypoints = findExportsInImports(
       entrypoint,
-      resolvedImports
+      resolvedImports,
+      this.services
     );
 
     for (const importedEntrypoint of importedEntrypoints) {

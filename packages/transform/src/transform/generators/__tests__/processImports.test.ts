@@ -52,10 +52,12 @@ describe('processImports', () => {
     syncActionRunner(action, handlers);
 
     expect(freshnessSpy).not.toHaveBeenCalled();
-    expect(createChildSpy).toHaveBeenCalledWith(depPath, [
-      '__wywPreval',
-      'value',
-    ]);
+    expect(createChildSpy).toHaveBeenCalledWith(
+      depPath,
+      ['__wywPreval', 'value'],
+      undefined,
+      services
+    );
     expect(handlers.processEntrypoint).toHaveBeenCalledTimes(1);
   });
 
@@ -207,10 +209,12 @@ describe('processImports', () => {
     syncActionRunner(action, handlers);
 
     expect(freshnessSpy).not.toHaveBeenCalled();
-    expect(createChildSpy).toHaveBeenCalledWith(depPath, [
-      '__wywPreval',
-      'value',
-    ]);
+    expect(createChildSpy).toHaveBeenCalledWith(
+      depPath,
+      ['__wywPreval', 'value'],
+      undefined,
+      services
+    );
     expect(handlers.processEntrypoint).toHaveBeenCalledTimes(1);
   });
 
@@ -258,7 +262,12 @@ describe('processImports', () => {
 
     syncActionRunner(action, handlers);
 
-    expect(createChildSpy).toHaveBeenCalledWith(depPath, ['value']);
+    expect(createChildSpy).toHaveBeenCalledWith(
+      depPath,
+      ['value'],
+      undefined,
+      services
+    );
     expect(handlers.processEntrypoint).toHaveBeenCalledTimes(1);
   });
 });

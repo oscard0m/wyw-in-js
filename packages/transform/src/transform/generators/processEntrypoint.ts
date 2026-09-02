@@ -41,9 +41,11 @@ export function* processEntrypoint(
 
     this.entrypoint.assertNotSuperseded();
 
-    this.entrypoint.setTransformResult(result);
+    this.entrypoint.setTransformResult(result, this.services);
 
-    const supersededWith = this.entrypoint.applyDeferredSupersede();
+    const supersededWith = this.entrypoint.applyDeferredSupersede(
+      this.services
+    );
     if (supersededWith) {
       log('processing finished, deferred only detected; schedule next attempt');
       yield* this.getNext('processEntrypoint', supersededWith, undefined, null);
@@ -102,9 +104,11 @@ export async function* processEntrypointAsync(
 
     this.entrypoint.assertNotSuperseded();
 
-    this.entrypoint.setTransformResult(result);
+    this.entrypoint.setTransformResult(result, this.services);
 
-    const supersededWith = this.entrypoint.applyDeferredSupersede();
+    const supersededWith = this.entrypoint.applyDeferredSupersede(
+      this.services
+    );
     if (supersededWith) {
       log('processing finished, deferred only detected; schedule next attempt');
       yield* this.getNext('processEntrypoint', supersededWith, undefined, null);

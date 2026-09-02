@@ -1788,7 +1788,7 @@ export class EvalBroker {
       const target =
         cached.evaluated || !('createEvaluated' in cached)
           ? cached
-          : cached.createEvaluated();
+          : cached.createEvaluated(this.currentServices);
 
       const exportsProxy = target.exports;
       Object.entries(serializedExports).forEach(([key, serialized]) => {

@@ -198,6 +198,35 @@ it('keeps a strong entrypoint reference when WeakRef eval mode is disabled', asy
   }
 });
 
+it('uses the module services for evaluated and ignored child entrypoints', async () => {
+  const entrypointServices = createServices({});
+  const moduleServices = createServices({});
+  const entrypoint = createEntrypoint(entrypointServices, filename, ['*'], '');
+  moduleServices.cache.add('entrypoints', filename, entrypoint);
+  const mod = new Module(moduleServices, entrypoint);
+  const createEvaluatedSpy = jest.spyOn(entrypoint, 'createEvaluated');
+
+  await mod.evaluate();
+
+  expect(createEvaluatedSpy).toHaveBeenCalledWith(moduleServices);
+
+  const createChildSpy = jest.spyOn(entrypoint, 'createChild');
+  (mod as unknown as { ignored: boolean }).ignored = true;
+  const childFilename = path.resolve(
+    __dirname,
+    './__fixtures__/sample-script.js'
+  );
+
+  mod.getEntrypoint(childFilename, ['*'], logger);
+
+  expect(createChildSpy).toHaveBeenCalledWith(
+    childFilename,
+    ['*'],
+    fs.readFileSync(childFilename, 'utf-8'),
+    moduleServices
+  );
+});
+
 it('requires .js files', async () => {
   const { mod } = create`
     const answer = require('./sample-script');

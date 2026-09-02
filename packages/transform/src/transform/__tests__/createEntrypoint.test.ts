@@ -1,5 +1,6 @@
 import type { Services } from '../types';
 import { createActionContext, disposeActionContext } from '../ActionContext';
+import { EventEmitter } from '../../utils/EventEmitter';
 
 import { createEntrypoint, createServices } from './entrypoint-helpers';
 
@@ -92,6 +93,46 @@ describe('createEntrypoint', () => {
       name: '/foo/bar.js',
       only: ['default', 'named'],
     });
+  });
+
+  it('uses the requesting services when widening a cached root', () => {
+    let originalEmitterClosed = false;
+    const assertOriginalEmitterOpen = () => {
+      if (originalEmitterClosed) {
+        throw new Error('stale entrypoint emitter was used');
+      }
+    };
+    services.eventEmitter = new EventEmitter(
+      assertOriginalEmitterOpen,
+      () => {
+        assertOriginalEmitterOpen();
+        return 0;
+      },
+      assertOriginalEmitterOpen
+    );
+
+    const entrypoint1 = createEntrypoint(services, '/foo/bar.js', ['default']);
+    originalEmitterClosed = true;
+
+    const nextEvents: string[] = [];
+    const nextServices: Services = {
+      ...services,
+      eventEmitter: new EventEmitter(
+        () => {},
+        () => 0,
+        (_sequenceId, _timestamp, event) => nextEvents.push(event.type)
+      ),
+    };
+    const entrypoint2 = createEntrypoint(nextServices, '/foo/bar.js', [
+      'named',
+    ]);
+
+    expect(entrypoint2).not.toBe(entrypoint1);
+    expect(entrypoint1.supersededWith).toBe(entrypoint2);
+    expect(entrypoint2.only).toEqual(['default', 'named']);
+    expect(nextEvents).toEqual(
+      expect.arrayContaining(['created', 'superseded'])
+    );
   });
 
   it('should take from cache if only is subset of cached', () => {

@@ -97,6 +97,7 @@ type NextParams<
   entrypoint: Entrypoint,
   data: TNextAction['data'],
   abortSignal?: AbortSignal | null,
+  services?: Services,
 ];
 
 export type YieldArg = {
@@ -150,7 +151,7 @@ export type GetNext = <
 >(
   ...args: NextParams<TType, TNextAction>
 ) => Generator<
-  [TType, Entrypoint, TNextAction['data'], AbortSignal | null],
+  NextParams<TType, TNextAction>,
   TypeOfResult<TNextAction>,
   YieldResult
 >;

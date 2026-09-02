@@ -426,7 +426,7 @@ export class Module {
       this.cache.add(
         'entrypoints',
         entrypoint.name,
-        entrypoint.createEvaluated()
+        entrypoint.createEvaluated(this.services)
       );
       evaluatedCreated = true;
     }
@@ -535,7 +535,8 @@ export class Module {
       const newEntrypoint = this.entrypoint.createChild(
         filename,
         ['*'],
-        fs.readFileSync(strippedFilename, 'utf-8')
+        fs.readFileSync(strippedFilename, 'utf-8'),
+        this.services
       );
 
       if (newEntrypoint === 'loop') {

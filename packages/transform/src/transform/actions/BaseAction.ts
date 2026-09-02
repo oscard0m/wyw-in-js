@@ -102,18 +102,26 @@ export class BaseAction<TAction extends ActionQueueItem>
     type: TNextType,
     entrypoint: Entrypoint,
     data: TNextAction['data'],
-    abortSignal: AbortSignal | null = this.abortSignal
+    abortSignal: AbortSignal | null = this.abortSignal,
+    services?: Services
   ): Generator<
-    [TNextType, Entrypoint, TNextAction['data'], AbortSignal | null],
+    [TNextType, Entrypoint, TNextAction['data'], AbortSignal | null, Services?],
     TypeOfResult<TNextAction>,
     YieldResult
   > {
-    return (yield [
-      type,
-      entrypoint,
-      data,
-      abortSignal,
-    ]) as TypeOfResult<TNextAction>;
+    const next: [
+      TNextType,
+      Entrypoint,
+      TNextAction['data'],
+      AbortSignal | null,
+      Services?,
+    ] = [type, entrypoint, data, abortSignal];
+
+    if (services !== undefined) {
+      next.push(services);
+    }
+
+    return (yield next) as TypeOfResult<TNextAction>;
   }
 
   public onAbort(fn: () => void): () => void {

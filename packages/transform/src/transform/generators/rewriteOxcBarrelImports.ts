@@ -714,7 +714,8 @@ function* getWildcardExportDependencies(
         wildcardReexports.map((reexport) => [reexport.source, []])
       ),
     },
-    null
+    null,
+    analysisServices
   );
 
   const dependencies = new Set<string>();
@@ -753,7 +754,13 @@ function* getExportsForFile(
     undefined,
     this.entrypoint.graphTraversalToken
   );
-  return yield* this.getNext('getExports', entrypoint, undefined, null);
+  return yield* this.getNext(
+    'getExports',
+    entrypoint,
+    undefined,
+    null,
+    services
+  );
 }
 
 function* getOrBuildOxcBarrelManifest(
@@ -829,7 +836,8 @@ function* getOrBuildOxcBarrelManifest(
     {
       imports: buildImportsForResolve(analyzed),
     },
-    null
+    null,
+    analysisServices
   );
   const manifestDependencies = resolvedImports.flatMap((dependency) =>
     dependency.resolved ? [dependency.resolved] : []
