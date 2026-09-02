@@ -1,5 +1,18 @@
 # @wyw-in-js/webpack-loader
 
+## 2.5.0
+
+### Minor Changes
+
+- Bump versions
+
+### Patch Changes
+
+- 1ed0bb5: Keep extracted CSS available when Webpack or Rspack rebuilds generated CSS from persistent cache, when Rspack evaluates loaders in separate or parallel module graphs, when multiple object cache providers process the same resource, and when Windows reports the same file with different path spellings.
+- Updated dependencies
+  - @wyw-in-js/shared@2.5.0
+  - @wyw-in-js/transform@2.5.0
+
 ## 2.4.4
 
 ### Patch Changes

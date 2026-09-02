@@ -1,5 +1,29 @@
 # @wyw-in-js/transform
 
+## 2.5.0
+
+### Minor Changes
+
+- 2d589b5: Keep later static interpolations resolvable when opaque calls receive immutable primitive values or fresh containers built only from them. Specific calls and constructors can also be declared side-effect-free with a `/*#__PURE__*/` or `/*@__PURE__*/` annotation; static evaluation errors point to eligible call sites and show the exact placement.
+- 50299a4: Add root-scoped pipeline counters to file reporter output without changing transform results.
+- cf44565: Add evaluation broker, cache, preparation, and transport counters to file reporter output.
+- 522df8b: Reuse the Turbopack eval child process across files without sharing resolver or transform-cache semantics between loader invocations. Switching resolver semantics now recreates the runner's VM context and clears its WyW-managed modules and broker caches while retaining the child process, so concurrent server/client transforms of the same file cannot resolve through each other's loader context or observe top-level globals created by the other's evaluated modules. Node built-ins, environment values, and external module instances remain process-scoped. Advanced integrations can opt into full cache, module, and VM-context reuse with a `resolverScopeKey` only when the complete transform and eval configuration, aliases, conditions, and compilation graph semantics match. Importer paths are also stripped of query and hash before deriving the resolve context.
+
+### Patch Changes
+
+- 59ab82d: Run actions and entrypoint lifecycle updates with the services of the transform run that created them, instead of the services captured when an entrypoint first entered a shared cache. This prevents reused entrypoints from applying an earlier importer's filename, source map, output path, warning handler, or event emitter to the current file. Nested actions inherit their parent's run services by default, while internal analysis actions can retain their intentionally isolated cache and telemetry scope.
+- 08daf08: Keep answering resolve and load requests from a fire-and-forget dynamic import after its evaluation has finished. The eval broker scoped request liveness to the entrypoint that was active when the request arrived, so a `RESOLVE` sent right before `EVAL_RESULT` and delivered in the same stdout chunk was silently dropped once the eval completed. The runner then waited for that answer forever and the next load for the same semantic session never started, which surfaced as sporadic eval timeouts on busy machines. Liveness is now scoped by the semantic session (runner, session id, request epoch, services and cache generation); the next entrypoint still invalidates stale continuations through the request epoch.
+- 1421841: Parsing is cheaper on large projects. Compatible parses on supported runtimes now receive Oxc ASTs via the raw-transfer buffer instead of JSON, parse results are shared across filenames with equivalent parser semantics and across compatible source types, and cache lookups no longer allocate whole-file key strings.
+- 82ffa16: Reload invalidated evaluation modules even when their importing module's source is unchanged.
+- d8e2903: Stop reporting a false `PrevalPayload disagreement` for `styled(X)` targets whose evaluated and static values describe the same selector chain. The hybrid evaluator spells a proven opaque component as a bare function stub, while the static resolver spells it as `null`; these representations are now treated as equivalent only for helpers that the static analysis identified as opaque and for matching generated `__wyw_meta` chains. Static precedence is unchanged, and malformed metadata, extra value fields, or genuine selector drift are still reported.
+- 4aaea17: Prevent an unbounded supersede loop from growing a bundler process until it runs out of memory without weakening dependency invalidation. If an entrypoint replacement is evicted while it is still processing, retain the last complete dependency snapshot. When no complete graph exists, keep invalidating conservatively and restart transform and evaluation caches before rebuilding, so a warm evaluated module can never hide a changed transitive dependency.
+
+  As a final fail-closed safeguard, stop more than 100 identical-source, non-widening supersedes within a true sliding 10 second window with a diagnostic error. Unchanged retries remain blocked instead of reusing stale output; the guard resets after a successful transform, a real source edit, or a quiet window, and cleans up inactive filename counters.
+
+- Updated dependencies
+  - @wyw-in-js/processor-utils@2.5.0
+  - @wyw-in-js/shared@2.5.0
+
 ## 2.4.4
 
 ### Patch Changes
