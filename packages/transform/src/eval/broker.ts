@@ -2632,6 +2632,14 @@ export class EvalBroker {
     context: EvalRequestContext | undefined
   ): boolean {
     if (!context) return true;
+    // Liveness is scoped by the semantic session (runner, session id, request
+    // epoch, services and cache generation), not by the entrypoint that was
+    // active when the request arrived. A fire-and-forget dynamic import may
+    // send RESOLVE right before EVAL_RESULT; when both land in one stdout
+    // chunk the EVAL finishes (and clears activeEntrypoint) before the async
+    // resolve completes. Dropping that RESOLVE_RESULT would leave the runner
+    // awaiting forever and block the following LOAD. The next entrypoint bumps
+    // requestEpoch, so stale continuations are still rejected there.
     return (
       context.epoch === this.requestEpoch &&
       context.cacheGeneration ===
@@ -2639,8 +2647,7 @@ export class EvalBroker {
       context.runner === this.runner &&
       context.sessionId === this.activeRunnerSessionId &&
       context.services === this.currentServices &&
-      context.inputQueue === this.runnerInputQueue &&
-      context.entrypoint === this.activeEntrypoint
+      context.inputQueue === this.runnerInputQueue
     );
   }
 
