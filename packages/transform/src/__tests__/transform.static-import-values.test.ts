@@ -12,7 +12,7 @@ import { dirname, join, resolve } from 'path';
 import dedent from 'dedent';
 
 import { TransformCacheCollection } from '../cache';
-import { disposeEvalBroker } from '../eval/broker';
+import { disposeEvalBroker, EvalBroker } from '../eval/broker';
 import { transform } from '../transform';
 import type { PluginOptions } from '../types';
 import { EventEmitter } from '../utils/EventEmitter';
@@ -4078,6 +4078,104 @@ describe('transform static import value inlining', () => {
       expect(result.dependencies).toContain(baseFile);
       expect(perf.counts.get('transform:evalFile') ?? 0).toBe(0);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('merges retained eval stubs with statically proven opaque styled targets', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wyw-static-import-'));
+    const entryFile = join(root, 'StyledLink.js');
+    const linkFile = join(root, 'Link.js');
+    const themeFile = join(root, 'runtime-theme.js');
+    const cache = new TransformCacheCollection();
+    let opaqueNames: string[] = [];
+    const evaluateSpy = jest
+      .spyOn(EvalBroker.prototype, 'evaluate')
+      .mockImplementation(async (entrypoint) => {
+        const preevalResult = entrypoint.getPreevalResult();
+        const staticValues = preevalResult?.staticValueCache;
+        opaqueNames = preevalResult?.staticNullWYWMetaExtendsHelpers ?? [];
+        expect(opaqueNames).toHaveLength(1);
+        expect(staticValues).toBeDefined();
+        if (!preevalResult || !staticValues) {
+          throw new Error('expected a resolved static preeval result');
+        }
+
+        const toEvaluatedValue = (value: unknown): unknown => {
+          if (
+            typeof value !== 'object' ||
+            value === null ||
+            !('__wyw_meta' in value)
+          ) {
+            return value;
+          }
+
+          const meta = value.__wyw_meta as {
+            className: string;
+            extends: unknown;
+          };
+          return {
+            displayName:
+              'displayName' in value
+                ? value.displayName
+                : 'RetainedStyledValue',
+            __wyw_meta: {
+              className: meta.className,
+              extends:
+                meta.extends === null
+                  ? () => {}
+                  : toEvaluatedValue(meta.extends),
+            },
+          };
+        };
+        const values = new Map<string, unknown>(
+          (preevalResult.dependencyNames ?? []).map((name) => [name, 'red'])
+        );
+        staticValues.forEach((value, name) => {
+          values.set(
+            name,
+            opaqueNames.includes(name) ? () => {} : toEvaluatedValue(value)
+          );
+        });
+
+        return { dependencies: [], values };
+      });
+
+    writeFileSync(linkFile, 'export const Link = () => null;\n');
+    writeFileSync(
+      themeFile,
+      "export const color = Date.now() > 0 ? 'red' : 'blue';\n"
+    );
+    writeFileSync(
+      entryFile,
+      dedent`
+        import { styled } from 'test-styled-processor';
+        import { Link } from './Link.js';
+        import { color } from './runtime-theme.js';
+
+        const StyledLink = styled(Link)\`
+          display: flex;
+        \`;
+
+        export const StyledTextLink = styled(StyledLink)\`
+          color: \${color};
+        \`;
+      `
+    );
+
+    try {
+      const transformed = await runTransform(root, entryFile, cache);
+
+      expect(evaluateSpy).toHaveBeenCalledTimes(1);
+      expect(opaqueNames).toHaveLength(1);
+      expect(transformed.cssText).toContain('display:flex');
+      expect(transformed.cssText).toContain('color:red');
+      expect(transformed.cssText).toMatch(
+        /\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\s*\{[^}]*color:red;[^}]*\}/s
+      );
+    } finally {
+      evaluateSpy.mockRestore();
+      disposeEvalBroker(cache);
       rmSync(root, { recursive: true, force: true });
     }
   });
