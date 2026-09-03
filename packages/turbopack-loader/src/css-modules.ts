@@ -138,12 +138,15 @@ function splitSelectorList(selectorText: string) {
   return parts;
 }
 
-function wrapSelector(selectorText: string) {
-  const selectors = splitSelectorList(selectorText)
+// One rule per list member: lightningcss folds `:global(a), :global(b)` into
+// `:is(a, b)` (parcel-bundler/lightningcss#1032, #1079, proposed fix #1231).
+// No separator: the source map appended in index.ts assumes one line per rule.
+function wrapRule(selectorText: string, blockBody: string) {
+  return splitSelectorList(selectorText)
     .map((s) => s.trim())
-    .filter(Boolean);
-
-  return selectors.map((selector) => `:global(${selector})`).join(', ');
+    .filter(Boolean)
+    .map((selector) => `:global(${selector}){${blockBody}}`)
+    .join('');
 }
 
 function makeCssModuleGlobalInner(css: string) {
@@ -218,7 +221,7 @@ function makeCssModuleGlobalInner(css: string) {
       }
 
       const blockBody = css.slice(openIdx + 1, blockEndIdx);
-      out += `${wrapSelector(selectorText)}{${blockBody}}`;
+      out += wrapRule(selectorText, blockBody);
       idx = blockEndIdx + 1;
     }
   }
