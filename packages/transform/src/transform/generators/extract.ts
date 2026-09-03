@@ -7,7 +7,7 @@ import type { Options, PreprocessorFn } from '../../types';
 import type { IExtractAction, SyncScenarioForAction } from '../types';
 import { createStylisPreprocessor } from './createStylisPreprocessor';
 
-function extractCssFromAst(
+export function extractCssFromAst(
   rules: Rules,
   originalCode: string,
   options: Pick<
@@ -34,10 +34,13 @@ function extractCssFromAst(
     }
   }
 
-  Object.keys(rules).forEach((selector, index) => {
+  // Kept comments and the `none` preprocessor produce multi-line rules.
+  let line = 1;
+
+  Object.keys(rules).forEach((selector) => {
     mappings.push({
       generated: {
-        line: index + 1,
+        line,
         column: 0,
       },
       original: rules[selector].start!,
@@ -45,13 +48,14 @@ function extractCssFromAst(
       source: '',
     });
 
-    if (rules[selector].atom) {
-      // For atoms, we just directly insert cssText, to give the atomizer full control over the rules
-      cssText += `${rules[selector].cssText}\n`;
-    } else {
-      // Run each rule through stylis to support nesting
-      cssText += `${preprocessor(selector, rules[selector].cssText)}\n`;
-    }
+    // Atoms are inserted as is, to give the atomizer full control over the
+    // rules; everything else runs through the preprocessor to support nesting.
+    const ruleCssText = rules[selector].atom
+      ? rules[selector].cssText
+      : preprocessor(selector, rules[selector].cssText);
+
+    cssText += `${ruleCssText}\n`;
+    line += ruleCssText.split('\n').length;
   });
 
   return {
